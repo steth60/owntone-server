@@ -104,6 +104,8 @@ struct settings_ctx
   int nb_channels;
   int bit_rate;
   int frame_size;
+  // Bypass the muxer and keep each encoder packet separate, see transcode_encode_raw()
+  bool raw_packets;
   enum AVSampleFormat sample_format;
   bool with_mp4_header;
   bool with_wav_header;
@@ -197,6 +199,13 @@ struct encode_ctx
 
   // Contains the most recent packet from avcodec_receive_packet()
   AVPacket *encoded_pkt;
+
+  // Sizes of the complete packets waiting in obuf (raw_packets profiles only),
+  // a simple FIFO: packet_sizes[packet_head] is the next packet to hand out
+  int *packet_sizes;
+  int packet_sizes_cap;
+  int packet_head;
+  int packet_count;
 
   // How many output bytes we have processed in total
   off_t bytes_processed;
@@ -299,6 +308,15 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
 	settings->frame_size = 352;
 	break;
 
+      case XCODE_AAC:
+	settings->encode_audio = true;
+	settings->format = "data"; // Not actually used, see raw_packets
+	settings->raw_packets = true;
+	settings->audio_codec = AV_CODEC_ID_AAC;
+	settings->sample_format = AV_SAMPLE_FMT_FLTP; // The native ffmpeg AAC encoder only does float planar
+	settings->bit_rate = 256000; // Same as Apple's own AAC streaming
+	break;
+
       case XCODE_MP4_ALAC:
 	settings->with_mp4_header = true;
 	settings->encode_audio = true;
@@ -387,7 +405,10 @@ init_settings(struct settings_ctx *settings, enum transcode_profile profile, str
       settings->bit_rate    = quality->bit_rate;
     }
 
-  if (quality && quality->bits_per_sample && (quality->bits_per_sample != 8 * av_get_bytes_per_sample(settings->sample_format)))
+  // Lossy encoders that work in float internally (AAC) have no output bit depth,
+  // so for those bits_per_sample just describes the input and can't be checked
+  bool is_float = (settings->sample_format == AV_SAMPLE_FMT_FLT || settings->sample_format == AV_SAMPLE_FMT_FLTP);
+  if (quality && quality->bits_per_sample && !is_float && (quality->bits_per_sample != 8 * av_get_bytes_per_sample(settings->sample_format)))
     {
       DPRINTF(E_LOG, L_XCODE, "Bug! Mismatch between profile (%d bps) and media quality (%d bps)\n", 8 * av_get_bytes_per_sample(settings->sample_format), quality->bits_per_sample);
       return -1;
@@ -798,6 +819,39 @@ packet_prepare(AVPacket *pkt, struct stream_ctx *s)
   av_packet_rescale_ts(pkt, s->codec->time_base, s->stream->time_base);
 }
 
+// Appends an encoder packet to obuf and records its size, so that
+// transcode_encode_packet_get() can later hand it out as one unit
+static int
+packet_queue_add(struct encode_ctx *ctx, AVPacket *pkt)
+{
+  int *sizes;
+  int tail;
+
+  if (pkt->size <= 0)
+    return 0;
+
+  if (ctx->packet_count == ctx->packet_sizes_cap)
+    {
+      // Grow and unwrap the ring
+      CHECK_NULL(L_XCODE, sizes = malloc((ctx->packet_sizes_cap + 64) * sizeof(int)));
+      for (int i = 0; i < ctx->packet_count; i++)
+	sizes[i] = ctx->packet_sizes[(ctx->packet_head + i) % ctx->packet_sizes_cap];
+      free(ctx->packet_sizes);
+      ctx->packet_sizes = sizes;
+      ctx->packet_sizes_cap += 64;
+      ctx->packet_head = 0;
+    }
+
+  if (evbuffer_add(ctx->obuf, pkt->data, pkt->size) < 0)
+    return -1;
+
+  tail = (ctx->packet_head + ctx->packet_count) % ctx->packet_sizes_cap;
+  ctx->packet_sizes[tail] = pkt->size;
+  ctx->packet_count++;
+
+  return 0;
+}
+
 /*
  * Part 4+5 of the conversion chain: read -> decode -> filter -> encode -> write
  *
@@ -821,6 +875,16 @@ encode_write(struct encode_ctx *ctx, struct stream_ctx *s, AVFrame *filt_frame)
 	    ret = 0;
 
 	  break;
+	}
+
+      if (ctx->settings.raw_packets)
+	{
+	  ret = packet_queue_add(ctx, ctx->encoded_pkt);
+	  av_packet_unref(ctx->encoded_pkt);
+	  if (ret < 0)
+	    break;
+
+	  continue;
 	}
 
       packet_prepare(ctx->encoded_pkt, s);
@@ -2250,6 +2314,7 @@ transcode_encode_cleanup(struct encode_ctx **ctx)
   evbuffer_free((*ctx)->evbuf_io.evbuf);
   av_packet_free(&(*ctx)->encoded_pkt);
   av_frame_free(&(*ctx)->filt_frame);
+  free((*ctx)->packet_sizes);
   free(*ctx);
   *ctx = NULL;
 }
@@ -2344,6 +2409,55 @@ transcode_encode(struct evbuffer *evbuf, struct encode_ctx *ctx, transcode_frame
   evbuffer_add_buffer(evbuf, ctx->obuf);
 
   return ret;
+}
+
+int
+transcode_encode_raw(struct encode_ctx *ctx, transcode_frame *frame, int eof)
+{
+  int ret;
+
+  if (!ctx->settings.raw_packets)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Bug! transcode_encode_raw() called with a profile that is not raw packets\n");
+      return -1;
+    }
+
+  if (frame)
+    {
+      ret = filter_encode_write(ctx, &ctx->audio_stream, frame);
+      if (ret < 0)
+	{
+	  DPRINTF(E_LOG, L_XCODE, "Error occurred while encoding: %s\n", err2str(ret));
+	  return ret;
+	}
+    }
+
+  // Flush the filtergraph and the encoder, so the last (possibly partial) packets come out
+  if (eof)
+    filter_encode_write(ctx, &ctx->audio_stream, NULL);
+
+  return ctx->packet_count;
+}
+
+int
+transcode_encode_packet_get(struct evbuffer *evbuf, struct encode_ctx *ctx)
+{
+  int size;
+
+  if (ctx->packet_count == 0)
+    return 0;
+
+  size = ctx->packet_sizes[ctx->packet_head];
+  ctx->packet_head = (ctx->packet_head + 1) % ctx->packet_sizes_cap;
+  ctx->packet_count--;
+
+  if (evbuffer_remove_buffer(ctx->obuf, evbuf, size) != size)
+    {
+      DPRINTF(E_LOG, L_XCODE, "Bug! Encoded packet queue out of sync with output buffer\n");
+      return -1;
+    }
+
+  return size;
 }
 
 int

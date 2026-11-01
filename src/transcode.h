@@ -26,6 +26,9 @@ enum transcode_profile
   XCODE_OPUS,
   // Transcodes the best audio stream to raw ALAC (no container)
   XCODE_ALAC,
+  // Transcodes the best audio stream to raw AAC-LC access units (no container,
+  // no ADTS headers), 1024 samples per packet. Used for AirPlay 2 buffered audio.
+  XCODE_AAC,
   // Transcodes the best audio stream to ALAC in a MP4 container
   XCODE_MP4_ALAC,
   // Produces just the header for a MP4 container with ALAC
@@ -154,6 +157,30 @@ transcode_decode(transcode_frame **frame, struct decode_ctx *ctx);
  */
 int
 transcode_encode(struct evbuffer *evbuf, struct encode_ctx *ctx, transcode_frame *frame, int eof);
+
+/* Encodes a frame with a raw-packet profile (currently XCODE_AAC) but keeps the
+ * encoded packets internally, so the caller can retrieve them one complete
+ * packet (access unit) at a time with transcode_encode_packet_get(). Unlike
+ * transcode_encode() the number of packets produced by one call is not fixed:
+ * encoders with a fixed frame size and priming delay (AAC) may produce zero or
+ * several packets per input frame.
+ *
+ * @in  ctx        Encode context created with a raw-packet profile
+ * @in  frame      The frame to encode, e.g. from transcode_frame_new()
+ * @in  eof        If true the encoder is flushed, so the last packets come out
+ * @return         Number of complete packets now available, negative if error
+ */
+int
+transcode_encode_raw(struct encode_ctx *ctx, transcode_frame *frame, int eof);
+
+/* Moves the next complete encoded packet from the encoder to evbuf
+ *
+ * @out evbuf      Receives exactly one encoded packet
+ * @in  ctx        Encode context
+ * @return         Size of the packet, 0 if no complete packet is available
+ */
+int
+transcode_encode_packet_get(struct evbuffer *evbuf, struct encode_ctx *ctx);
 
 /* Demuxes, decodes, encodes and remuxes from the input.
  *

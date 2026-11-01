@@ -157,6 +157,15 @@ EXTRA_DIST = \
 
 SUBDIRS = $(LIBRESPOTC_SUBDIR) libairptp
 
+# Unit tests, run with "make check"
+check_PROGRAMS = tests/test_transcode_aac
+tests_test_transcode_aac_SOURCES = tests/test_transcode_aac.c \
+	transcode.c logger.c conffile.c misc.c http.c
+tests_test_transcode_aac_LDADD = $(owntone_LDADD)
+TESTS = tests/test_transcode_aac.sh
+AM_TESTS_ENVIRONMENT = TEST_BIN='$(builddir)/tests/test_transcode_aac'; export TEST_BIN;
+EXTRA_DIST += tests/test_transcode_aac.sh
+
 # gperf construction rules
 %_hash.h: %.gperf
 	$(AM_V_GEN)$(GPERF) --output-file=$@ $<

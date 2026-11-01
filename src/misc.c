@@ -1972,6 +1972,8 @@ media_format_from_string(const char *s)
     return MEDIA_FORMAT_ALAC;
   if (strcmp(s, "opus") == 0)
     return MEDIA_FORMAT_OPUS;
+  if (strcmp(s, "aac") == 0)
+    return MEDIA_FORMAT_AAC;
 
   return MEDIA_FORMAT_UNKNOWN;
 }
@@ -1989,6 +1991,8 @@ media_format_to_string(enum media_format format)
     return "alac";
   if (format == MEDIA_FORMAT_OPUS)
     return "opus";
+  if (format == MEDIA_FORMAT_AAC)
+    return "aac";
 
   return "unknown";
 }

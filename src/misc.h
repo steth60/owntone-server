@@ -306,11 +306,12 @@ enum media_format {
   MEDIA_FORMAT_MP3     = (1 << 2),
   MEDIA_FORMAT_ALAC    = (1 << 3),
   MEDIA_FORMAT_OPUS    = (1 << 4),
+  MEDIA_FORMAT_AAC     = (1 << 5),
 };
 
 // For iteration
 #define MEDIA_FORMAT_FIRST MEDIA_FORMAT_PCM
-#define MEDIA_FORMAT_LAST MEDIA_FORMAT_OPUS
+#define MEDIA_FORMAT_LAST MEDIA_FORMAT_AAC
 #define MEDIA_FORMAT_NEXT(f) (f << 1)
 
 // Remember to adjust quality_is_equal() if adding elements
