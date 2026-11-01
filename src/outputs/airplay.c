@@ -3337,10 +3337,19 @@ response_handler_setup_stream(struct evrtsp_request *req, struct airplay_session
       session->control_port = uintval;
     }
 
-  if (session->data_port == 0 || session->control_port == 0)
+  // Buffered streams don't use the control port (no sync packets or retransmits),
+  // and HomePods don't include one in their reply for type 103
+  if (session->data_port == 0 || (!session->buffered && session->control_port == 0))
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Missing port number in reply from '%s' (d=%u, c=%u)\n", session->devname, session->data_port, session->control_port);
       goto error;
+    }
+
+  item = plist_dict_get_item(stream, "audioBufferSize");
+  if (item && session->buffered)
+    {
+      plist_get_uint_val(item, &uintval);
+      DPRINTF(E_DBG, L_AIRPLAY, "Device '%s' has a buffer of %" PRIu64 " bytes for buffered audio\n", session->devname, uintval);
     }
 
   DPRINTF(E_DBG, L_AIRPLAY, "Negotiated %s streaming session; ports d=%u c=%u e=%u\n", session->buffered ? "TCP (buffered)" : "UDP (realtime)", session->data_port, session->control_port, session->events_port);
