@@ -82,6 +82,7 @@
 #include "input.h"
 #include "outputs.h"
 #include "player.h"
+#include "worker.h"
 #include "ptpd.h"
 #include "libairptp/airptp.h"
 
@@ -1042,22 +1043,45 @@ buffered_read_cb(struct bufferevent *bev, void *arg)
     }
 }
 
+/* The player is controlled from the worker thread: its commands wait for the
+ * player, and starting or stopping can take seconds while it talks to the
+ * speakers. The sender waits for our replies (Music.app even in its main
+ * thread), so the receiver thread must never block on the player.
+ */
+enum rx_player_action
+{
+  RX_PLAYER_START,
+  RX_PLAYER_FLUSH,
+  RX_PLAYER_STOP,
+  RX_PLAYER_VOLUME,
+};
+
+struct rx_player_job
+{
+  enum rx_player_action action;
+  int session_id;
+  int volume;
+  char sender[128];
+  char why[32];
+};
+
+// Thread: worker
 static void
-playback_autostart(struct rx_session *s)
+playback_autostart(struct rx_player_job *job)
 {
   struct player_status status;
   struct media_file_info mfi = { 0 };
   struct db_queue_item qi;
   struct db_queue_item *queue_item;
   struct db_queue_add_info queue_add_info;
-  const char *sender = s->client_name ? s->client_name : s->peer_addr;
+  const char *sender = job->sender;
   int ret;
 
   ret = player_get_status(&status);
   if (ret == 0 && rx_queue_item_id && status.item_id == rx_queue_item_id && status.status != PLAY_STOPPED)
     return; // Already ours
 
-  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: starting playback of the AirPlay stream from '%s'\n", s->id, sender);
+  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: starting playback of the AirPlay stream from '%s'\n", job->session_id, sender);
 
   mfi.path = safe_asprintf("airplay://%s", rx_device_id_raop);
   mfi.virtual_path = safe_asprintf("/%s", mfi.path);
@@ -1090,7 +1114,7 @@ playback_autostart(struct rx_session *s)
 
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not add the AirPlay stream to the queue\n", s->id);
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not add the AirPlay stream to the queue\n", job->session_id);
       return;
     }
 
@@ -1102,15 +1126,53 @@ playback_autostart(struct rx_session *s)
   free_queue_item(queue_item, 0);
   if (ret < 0)
     {
-      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not start playback of the AirPlay stream\n", s->id);
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not start playback of the AirPlay stream\n", job->session_id);
       return;
     }
 
   rx_queue_item_id = queue_add_info.new_item_id;
 }
 
+// Drops what the player has buffered from the stream, so a pause, skip or
+// seek is heard right away instead of after the buffered audio has played
+// out. The player resumes by itself when the input has refilled its buffer
+// (see playback_flush() in player.c). Only if it is our stream that plays.
+// Thread: worker
+static void
+player_flush_if_ours(struct rx_player_job *job)
+{
+  struct player_status status;
+
+  if (player_get_status(&status) < 0)
+    return;
+  if (!rx_queue_item_id || status.item_id != rx_queue_item_id || status.status != PLAY_PLAYING)
+    return;
+
+  DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: flushing the player (%s)\n", job->session_id, job->why);
+  player_playback_flush();
+}
+
+// When the sender stops streaming to us, stop right away rather than play
+// out what is buffered (the input would otherwise just signal end of file)
+// Thread: worker
+static void
+player_stop_if_ours(struct rx_player_job *job)
+{
+  struct player_status status;
+
+  if (player_get_status(&status) < 0)
+    return;
+  if (!rx_queue_item_id || status.item_id != rx_queue_item_id || status.status == PLAY_STOPPED)
+    return;
+
+  DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: stopping the player (%s)\n", job->session_id, job->why);
+  player_playback_stop();
+}
+
 // Sender volume is in dB, -30 to 0, and -144 for mute (same mapping as the
 // pipe input uses for Shairport's pvol)
+static void player_job_queue(enum rx_player_action action, struct rx_session *s, const char *why, int volume);
+
 static void
 volume_apply(struct rx_session *s, float airplay_volume)
 {
@@ -1124,7 +1186,42 @@ volume_apply(struct rx_session *s, float airplay_volume)
     return;
 
   DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: sender volume %.2f dB, setting volume %d\n", s->id, airplay_volume, volume);
-  player_volume_set(volume);
+  player_job_queue(RX_PLAYER_VOLUME, s, "volume", volume);
+}
+
+// Thread: worker
+static void
+player_job_cb(void *arg)
+{
+  struct rx_player_job *job = arg;
+
+  switch (job->action)
+    {
+      case RX_PLAYER_START:
+	playback_autostart(job);
+	break;
+      case RX_PLAYER_FLUSH:
+	player_flush_if_ours(job);
+	break;
+      case RX_PLAYER_STOP:
+	player_stop_if_ours(job);
+	break;
+      case RX_PLAYER_VOLUME:
+	player_volume_set(job->volume);
+	break;
+    }
+}
+
+// Thread: airplayrx
+static void
+player_job_queue(enum rx_player_action action, struct rx_session *s, const char *why, int volume)
+{
+  struct rx_player_job job = { .action = action, .session_id = s->id, .volume = volume };
+
+  snprintf(job.sender, sizeof(job.sender), "%s", s->client_name ? s->client_name : s->peer_addr);
+  snprintf(job.why, sizeof(job.why), "%s", why);
+
+  worker_execute(player_job_cb, &job, sizeof(job), 0);
 }
 
 
@@ -1735,12 +1832,14 @@ handle_teardown(struct rx_session *s, struct rx_request *req, struct rx_response
     {
       DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: TEARDOWN of the audio stream\n", s->id);
       stream_end(s->id, "TEARDOWN");
+      player_job_queue(RX_PLAYER_STOP, s, "TEARDOWN", 0);
       session_streams_stop(s);
       return;
     }
 
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: TEARDOWN of the session\n", s->id);
   stream_end(s->id, "TEARDOWN");
+  player_job_queue(RX_PLAYER_STOP, s, "TEARDOWN", 0);
   session_streams_stop(s);
   service_free(s->event_svc);
   s->event_svc = NULL;
@@ -1834,6 +1933,8 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
       // Rate change only (pause), no new anchor
       DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", no anchor\n", s->id, rate);
       stream_anchor_set(rate, false, 0, 0);
+      if (rate == 0)
+	player_job_queue(RX_PLAYER_FLUSH, s, "pause", 0);
       return;
     }
 
@@ -1849,7 +1950,7 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
 	      s->id, rate, rtptime, (uint64_t)(remote_ns / 1000000000ULL), (uint64_t)(remote_ns % 1000000000ULL), timeline_id);
       stream_anchor_set(rate, true, (uint32_t)rtptime, now_ns() + outputs_buffer_duration_ms_get() * 1000000ULL);
       if (rate)
-	playback_autostart(s);
+	player_job_queue(RX_PLAYER_START, s, "anchor", 0);
       return;
     }
 
@@ -1863,7 +1964,7 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
 
   stream_anchor_set(rate, true, s->anchor_rtptime, s->anchor_local_ns);
   if (rate)
-    playback_autostart(s);
+    player_job_queue(RX_PLAYER_START, s, "anchor", 0);
 }
 
 static void
@@ -1881,10 +1982,18 @@ handle_flushbuffered(struct rx_session *s, struct rx_request *req, struct rx_res
 
   has_from = (plist_dict_get_uint_val(req->plist, "flushFromSeq", &from_seq) == 0);
 
+  // Senders count with more bits than the packets carry
+  from_seq &= RX_SEQ_MASK;
+  until_seq &= RX_SEQ_MASK;
+
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: FLUSHBUFFERED %s seq %" PRIu64 " until %" PRIu64 "\n", s->id,
 	  has_from ? "from" : "everything before", has_from ? from_seq : until_seq, until_seq);
 
   stream_flush(has_from, (uint32_t)from_seq, (uint32_t)until_seq);
+
+  // A range flush is for audio further ahead, what plays now stays
+  if (!has_from)
+    player_job_queue(RX_PLAYER_FLUSH, s, "flush", 0);
 }
 
 static void
@@ -2077,13 +2186,7 @@ airplay_receiver(void *arg)
 {
   thread_setname("airplayrx");
 
-  // Autostart adds the stream to the queue
-  if (db_perthread_init() < 0)
-    DPRINTF(E_LOG, L_AIRPLAY_RX, "Could not init database access, autostart won't work\n");
-
   event_base_dispatch(evbase_rx);
-
-  db_perthread_deinit();
 
   if (rx_enabled)
     DPRINTF(E_INFO, L_AIRPLAY_RX, "AirPlay receiver event loop terminated\n");
