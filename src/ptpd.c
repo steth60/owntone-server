@@ -78,6 +78,15 @@ ptpd_slave_remove(uint32_t slave_id)
   airptp_peer_remove(slave_id, ptpd_hdl);
 }
 
+int
+ptpd_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id)
+{
+  if (!ptpd_hdl)
+    return -1;
+
+  return airptp_clock_info_get(info, clock_id, ptpd_hdl);
+}
+
 // Thread: main (root priviliges may be required for binding)
 int
 ptpd_find_or_bind(void)

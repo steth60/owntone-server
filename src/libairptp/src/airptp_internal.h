@@ -83,6 +83,34 @@ struct airptp_peer
   uint64_t last_seen;
 };
 
+#define AIRPTP_MAX_CLOCK_SOURCES 8
+
+// A remote master clock we follow (see airptp_clock_info_get)
+struct airptp_clock_source
+{
+  bool in_use;
+  uint64_t clock_id;
+  union utils_net_sockaddr naddr;
+
+  // Two-step sync: receive time of the Sync that waits for its Follow Up
+  bool sync_pending;
+  uint16_t sync_seq;
+  uint64_t sync_rx_ns;
+
+  bool offset_valid;
+  int64_t offset_ns;   // Remote time minus our CLOCK_MONOTONIC time
+  uint64_t updated_ns;
+  uint64_t samples;
+  uint64_t steps;
+  double jitter_ns;
+
+  uint64_t drift_ref_ns;
+  int64_t drift_ref_offset_ns;
+  double drift_ppm;
+
+  uint64_t grandmaster_id;
+};
+
 struct airptp_daemon
 {
   bool is_shared;
@@ -115,6 +143,10 @@ struct airptp_daemon
 
   struct airptp_peer peers[AIRPTP_MAX_PEERS];
   int num_peers;
+
+  // Written by the daemon thread, read by airptp_clock_info_get()
+  pthread_mutex_t clock_sources_lck;
+  struct airptp_clock_source clock_sources[AIRPTP_MAX_CLOCK_SOURCES];
 };
 
 struct airptp_handle

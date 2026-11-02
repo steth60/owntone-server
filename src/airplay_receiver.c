@@ -52,6 +52,7 @@
 #include <errno.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <time.h>
 #include <ifaddrs.h>
 #include <sys/types.h>
 #include <sys/socket.h>
@@ -74,6 +75,8 @@
 #include "misc.h"
 #include "mdns.h"
 #include "commands.h"
+#include "ptpd.h"
+#include "libairptp/airptp.h"
 
 // Values advertised by the sender-compatible receiver we model ourselves on
 // (Shairport Sync 5.6 in AirPlay 2 mode). Music.app accepts these.
@@ -142,6 +145,14 @@ struct rx_session
   char *timing_protocol;
   char *group_uuid;
   int stream_type;
+
+  // Latest SETRATEANCHORTIME, converted to our clock (phase 3 plays from it)
+  bool anchor_valid;
+  uint64_t anchor_rate;
+  uint32_t anchor_rtptime;
+  uint64_t anchor_clock_id;
+  uint64_t anchor_local_ns; // CLOCK_MONOTONIC time when anchor_rtptime plays
+  int feedback_count;
 
   struct rx_service *event_svc;
   struct rx_service *data_svc;
@@ -1293,22 +1304,82 @@ handle_set_parameter(struct rx_session *s, struct rx_request *req, struct rx_res
     DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: SET_PARAMETER %s, %zu bytes\n", s->id, ctype ? ctype : "(no type)", req->body_len);
 }
 
+static uint64_t
+now_ns(void)
+{
+  struct timespec ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (uint64_t)ts.tv_sec * 1000000000ULL + ts.tv_nsec;
+}
+
+static void
+clock_log(int severity, struct rx_session *s, uint64_t clock_id)
+{
+  struct airptp_clock_info ci;
+
+  if (ptpd_clock_info_get(&ci, clock_id) < 0)
+    {
+      DPRINTF(severity, L_AIRPLAY_RX, "Connection %d: not following the sender's clock %" PRIx64 " (yet)\n", s->id, clock_id);
+      return;
+    }
+
+  DPRINTF(severity, L_AIRPLAY_RX, "Connection %d: sender clock %" PRIx64 " (%s): offset %" PRIi64 ".%06" PRIi64 " s, updated %" PRIu64 " ms ago, jitter %.1f us, drift %+.2f ppm, %" PRIu64 " samples, %" PRIu64 " steps\n",
+	  s->id, ci.clock_id, ci.address, (int64_t)(ci.offset_ns / 1000000000LL), (int64_t)(llabs(ci.offset_ns % 1000000000LL) / 1000),
+	  (now_ns() - ci.updated_ns) / 1000000, ci.jitter_us, ci.drift_ppm, ci.samples, ci.steps);
+}
+
 static void
 handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx_response *resp)
 {
+  struct airptp_clock_info ci;
   uint64_t rate = 0;
   uint64_t rtptime = 0;
   uint64_t secs = 0;
+  uint64_t frac = 0;
+  uint64_t timeline_id = 0;
+  uint64_t remote_ns;
+  int64_t ahead_ms;
 
-  if (req->plist)
+  if (!req->plist)
     {
-      plist_dict_get_uint_val(req->plist, "rate", &rate);
-      plist_dict_get_uint_val(req->plist, "rtpTime", &rtptime);
-      plist_dict_get_uint_val(req->plist, "networkTimeSecs", &secs);
+      resp->code = 400;
+      return;
     }
 
-  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 ", network time %" PRIu64 " s\n",
-	  s->id, rate, rtptime, secs);
+  plist_dict_get_uint_val(req->plist, "rate", &rate);
+  plist_dict_get_uint_val(req->plist, "rtpTime", &rtptime);
+  plist_dict_get_uint_val(req->plist, "networkTimeSecs", &secs);
+  plist_dict_get_uint_val(req->plist, "networkTimeFrac", &frac);
+  plist_dict_get_uint_val(req->plist, "networkTimeTimelineID", &timeline_id);
+
+  s->anchor_rate = rate;
+  if (!secs)
+    {
+      // Rate change only (pause), no new anchor
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", no anchor\n", s->id, rate);
+      return;
+    }
+
+  // networkTimeFrac is a 64 bit binary fraction of a second
+  remote_ns = secs * 1000000000ULL + (((frac >> 32) * 1000000000ULL) >> 32);
+  s->anchor_clock_id = timeline_id;
+
+  if (ptpd_clock_info_get(&ci, timeline_id) < 0)
+    {
+      s->anchor_valid = false;
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 " at %" PRIu64 ".%09" PRIu64 " on clock %" PRIx64 ", which we are not following\n",
+	      s->id, rate, rtptime, (uint64_t)(remote_ns / 1000000000ULL), (uint64_t)(remote_ns % 1000000000ULL), timeline_id);
+      return;
+    }
+
+  s->anchor_valid = true;
+  s->anchor_rtptime = (uint32_t)rtptime;
+  s->anchor_local_ns = remote_ns - ci.offset_ns;
+  ahead_ms = ((int64_t)s->anchor_local_ns - (int64_t)now_ns()) / 1000000;
+
+  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 " plays %" PRIi64 " ms %s (sender clock %" PRIx64 ", jitter %.1f us, drift %+.2f ppm)\n",
+	  s->id, rate, rtptime, (int64_t)llabs(ahead_ms), ahead_ms >= 0 ? "from now" : "ago", timeline_id, ci.jitter_us, ci.drift_ppm);
 }
 
 static void
@@ -1334,7 +1405,13 @@ request_handle(struct rx_session *s, struct rx_request *req)
     handle_pair_verify(s, req, &resp);
   else if (strcmp(req->method, "POST") == 0 && strcmp(req->path, "/fp-setup") == 0)
     handle_fp_setup(s, req, &resp);
-  else if (strcmp(req->method, "POST") == 0 && (strcmp(req->path, "/feedback") == 0 || strcmp(req->path, "/command") == 0 ||
+  else if (strcmp(req->method, "POST") == 0 && strcmp(req->path, "/feedback") == 0)
+    {
+      s->feedback_count++;
+      if (s->anchor_clock_id)
+	clock_log((s->feedback_count % 5 == 0) ? E_LOG : E_DBG, s, s->anchor_clock_id);
+    }
+  else if (strcmp(req->method, "POST") == 0 && (strcmp(req->path, "/command") == 0 ||
 	   strcmp(req->path, "/audioMode") == 0 || strcmp(req->path, "/configure") == 0))
     ; // Accept
   else if (strcmp(req->method, "OPTIONS") == 0)

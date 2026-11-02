@@ -29,6 +29,10 @@ SOFTWARE.
 #include <unistd.h>
 #include <inttypes.h>
 #include <errno.h>
+#include <time.h>
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/uio.h>
 
 // For shm_open
 #include <sys/mman.h>
@@ -335,20 +339,71 @@ send_sync_cb(int fd, short what, void *arg)
   event_add(daemon->send_sync_timer, &daemon_send_sync_tv);
 }
 
+static inline uint64_t
+timespec_ns(struct timespec *ts)
+{
+  return (uint64_t)ts->tv_sec * 1000000000ULL + ts->tv_nsec;
+}
+
+// Returns the CLOCK_MONOTONIC time the message arrived. If the socket has
+// SO_TIMESTAMPNS the kernel's receive time is used, which removes the
+// scheduling delay until we get to read the message. The kernel stamps with
+// CLOCK_REALTIME, so it is converted using the current difference between the
+// two clocks.
+static uint64_t
+rx_time_get(struct msghdr *msg)
+{
+  struct timespec mono;
+
+  clock_gettime(CLOCK_MONOTONIC, &mono);
+
+#ifdef SCM_TIMESTAMPNS
+  struct cmsghdr *cmsg;
+  struct timespec kernel;
+  struct timespec real;
+  int64_t age;
+
+  for (cmsg = CMSG_FIRSTHDR(msg); cmsg; cmsg = CMSG_NXTHDR(msg, cmsg))
+    {
+      if (cmsg->cmsg_level != SOL_SOCKET || cmsg->cmsg_type != SCM_TIMESTAMPNS)
+	continue;
+
+      memcpy(&kernel, CMSG_DATA(cmsg), sizeof(kernel));
+      clock_gettime(CLOCK_REALTIME, &real);
+      age = (int64_t)(timespec_ns(&real) - timespec_ns(&kernel));
+      if (age >= 0 && age < 1000000000LL)
+	return timespec_ns(&mono) - age;
+    }
+#endif
+
+  return timespec_ns(&mono);
+}
+
 static void
 incoming_cb(int fd, short what, void *arg)
 {
   struct airptp_daemon *daemon = arg;
   union utils_net_sockaddr peer_addr;
-  socklen_t peer_addrlen = sizeof(peer_addr);
+  socklen_t peer_addrlen;
   uint8_t req[1024];
+  uint8_t control[256];
+  struct iovec iov = { .iov_base = req, .iov_len = sizeof(req) };
+  struct msghdr msg = { 0 };
+  uint64_t rx_ns;
   ssize_t len;
 
   // Shouldn't be necessary, but silences scan-build complaint about sa_family
-  // possibly being garbage after recvfrom()
+  // possibly being garbage after recvmsg()
   peer_addr.sa.sa_family = AF_UNSPEC;
 
-  len = recvfrom(fd, req, sizeof(req), 0, &peer_addr.sa, &peer_addrlen);
+  msg.msg_name = &peer_addr;
+  msg.msg_namelen = sizeof(peer_addr);
+  msg.msg_iov = &iov;
+  msg.msg_iovlen = 1;
+  msg.msg_control = control;
+  msg.msg_controllen = sizeof(control);
+
+  len = recvmsg(fd, &msg, 0);
   if (len <= 0 || peer_addr.sa.sa_family == AF_UNSPEC)
     {
       if (len < 0)
@@ -356,9 +411,12 @@ incoming_cb(int fd, short what, void *arg)
       return;
     }
 
+  rx_ns = rx_time_get(&msg);
+  peer_addrlen = msg.msg_namelen;
+
   peer_last_seen_update(daemon, &peer_addr, peer_addrlen);
 
-  ptp_msg_handle(daemon, req, len, &peer_addr, peer_addrlen);
+  ptp_msg_handle(daemon, req, len, &peer_addr, peer_addrlen, rx_ns);
 }
 
 static void

@@ -511,10 +511,181 @@ msg_peer_del_make(struct ptp_peer_signaling_message *msg, struct airptp_peer *pe
 }
 
 
+/* ---------------------------- Clock following ----------------------------- */
+
+// A sample further than this from the estimate means the remote clock jumped
+// (or restarted), so the estimate starts over
+#define CLOCK_STEP_NS 50000000LL
+// How fast the estimate follows samples that are below it, 1/N per sample.
+// Samples above the estimate are taken directly, see clock_source_sample()
+#define CLOCK_FOLLOW_DOWN 16
+#define CLOCK_DRIFT_INTERVAL_NS 10000000000ULL
+
+static inline uint64_t
+ptp_timestamp_ns(struct ptp_timestamp *ts)
+{
+  uint64_t secs = ((uint64_t)ts->seconds_hi << 32) | ts->seconds_low;
+  return secs * 1000000000ULL + ts->nanoseconds;
+}
+
+// Caller must hold clock_sources_lck
+static struct airptp_clock_source *
+clock_source_find(struct airptp_daemon *daemon, uint64_t clock_id, union utils_net_sockaddr *peer_addr, bool create)
+{
+  struct airptp_clock_source *src;
+  struct airptp_clock_source *oldest = NULL;
+  int i;
+
+  for (i = 0; i < AIRPTP_MAX_CLOCK_SOURCES; i++)
+    {
+      src = &daemon->clock_sources[i];
+      if (src->in_use && src->clock_id == clock_id)
+	return src;
+      if (!oldest || !src->in_use || (oldest->in_use && src->updated_ns < oldest->updated_ns))
+	oldest = src;
+    }
+
+  if (!create)
+    return NULL;
+
+  // Reuse a free slot, or the one that has been quiet the longest
+  memset(oldest, 0, sizeof(*oldest));
+  oldest->in_use = true;
+  oldest->clock_id = clock_id;
+  if (peer_addr)
+    oldest->naddr = *peer_addr;
+
+  airptp_logmsg("Following PTP clock %" PRIx64, clock_id);
+  return oldest;
+}
+
+// nqptp style estimate: network delay only ever makes a Sync arrive later, so
+// the sample with the largest offset is the least delayed one. Samples above
+// the estimate are taken as is, samples below only pull it down slowly (to
+// follow a remote clock that runs slower than ours).
+static void
+clock_source_sample(struct airptp_clock_source *src, uint64_t remote_ns, uint64_t rx_ns)
+{
+  int64_t sample = (int64_t)(remote_ns - rx_ns);
+  int64_t diff;
+
+  if (!src->offset_valid || llabs(sample - src->offset_ns) > CLOCK_STEP_NS)
+    {
+      if (src->offset_valid)
+	{
+	  airptp_logmsg("PTP clock %" PRIx64 " jumped by %" PRIi64 " us, restarting its estimate", src->clock_id, (sample - src->offset_ns) / 1000);
+	  src->steps++;
+	}
+
+      src->offset_valid = true;
+      src->offset_ns = sample;
+      src->jitter_ns = 0;
+      src->drift_ref_ns = rx_ns;
+      src->drift_ref_offset_ns = sample;
+      src->drift_ppm = 0;
+    }
+  else
+    {
+      diff = sample - src->offset_ns;
+      if (diff > 0)
+	src->offset_ns = sample;
+      else
+	{
+	  src->offset_ns += diff / CLOCK_FOLLOW_DOWN;
+	  src->jitter_ns += ((double)-diff - src->jitter_ns) / 32.0;
+	}
+    }
+
+  src->samples++;
+  src->updated_ns = rx_ns;
+
+  if (rx_ns - src->drift_ref_ns >= CLOCK_DRIFT_INTERVAL_NS)
+    {
+      src->drift_ppm = (double)(src->offset_ns - src->drift_ref_offset_ns) * 1e6 / (double)(rx_ns - src->drift_ref_ns);
+      src->drift_ref_ns = rx_ns;
+      src->drift_ref_offset_ns = src->offset_ns;
+    }
+}
+
+static void
+clock_source_sync(struct airptp_daemon *daemon, uint64_t clock_id, union utils_net_sockaddr *peer_addr, struct ptp_header *hdr, struct ptp_timestamp *origin, uint64_t rx_ns)
+{
+  struct airptp_clock_source *src;
+
+  // Our own clock never sends to us, but guard anyway
+  if (clock_id == daemon->clock_id)
+    return;
+
+  pthread_mutex_lock(&daemon->clock_sources_lck);
+
+  src = clock_source_find(daemon, clock_id, peer_addr, true);
+  if (hdr->flags & PTP_FLAG_TWO_STEP)
+    {
+      src->sync_pending = true;
+      src->sync_seq = hdr->sequenceId;
+      src->sync_rx_ns = rx_ns;
+    }
+  else
+    clock_source_sample(src, ptp_timestamp_ns(origin) + hdr->correctionField / 65536, rx_ns);
+
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
+}
+
+static void
+clock_source_follow_up(struct airptp_daemon *daemon, uint64_t clock_id, struct ptp_header *hdr, struct ptp_timestamp *precise_origin)
+{
+  struct airptp_clock_source *src;
+
+  pthread_mutex_lock(&daemon->clock_sources_lck);
+
+  src = clock_source_find(daemon, clock_id, NULL, false);
+  if (src && src->sync_pending && src->sync_seq == hdr->sequenceId)
+    {
+      // correctionField is in nanoseconds * 2^16
+      clock_source_sample(src, ptp_timestamp_ns(precise_origin) + hdr->correctionField / 65536, src->sync_rx_ns);
+      src->sync_pending = false;
+    }
+
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
+}
+
+static void
+clock_source_announce(struct airptp_daemon *daemon, uint64_t clock_id, uint64_t grandmaster_id)
+{
+  struct airptp_clock_source *src;
+
+  pthread_mutex_lock(&daemon->clock_sources_lck);
+
+  src = clock_source_find(daemon, clock_id, NULL, false);
+  if (src)
+    src->grandmaster_id = grandmaster_id;
+
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
+}
+
+void
+ptp_msg_clock_info_fill(struct airptp_clock_info *info, struct airptp_clock_source *src)
+{
+  union utils_net_sockaddr naddr = src->naddr;
+
+  memset(info, 0, sizeof(*info));
+  info->clock_id = src->clock_id;
+  info->grandmaster_id = src->grandmaster_id;
+  if (naddr.sa.sa_family == AF_INET || naddr.sa.sa_family == AF_INET6)
+    utils_net_address_get(info->address, sizeof(info->address), &naddr);
+  info->offset_ns = src->offset_ns;
+  info->updated_ns = src->updated_ns;
+  info->samples = src->samples;
+  info->steps = src->steps;
+  info->jitter_us = src->jitter_ns / 1000.0;
+  info->drift_ppm = src->drift_ppm;
+}
+
+
 /* ------------------------ Incoming message handling ----------------------- */
 
 static void
-sync_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, union utils_net_sockaddr *peer_addr, socklen_t peer_addr_len)
+sync_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, union utils_net_sockaddr *peer_addr, socklen_t peer_addr_len, uint64_t rx_ns)
 {
   struct ptp_sync_message *in = (struct ptp_sync_message *)req;
   struct ptp_sync_message sync = { 0 };
@@ -527,6 +698,8 @@ sync_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, union u
   sync.originTimestamp = ptp_timestamp_betoh(&in->originTimestamp);
 
   log_received("Sync", &sync.header, clock_id, &sync.originTimestamp);
+
+  clock_source_sync(daemon, clock_id, peer_addr, &sync.header, &sync.originTimestamp, rx_ns);
 }
 
 static void
@@ -543,6 +716,8 @@ follow_up_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, un
   follow_up.preciseOriginTimestamp = ptp_timestamp_betoh(&in->preciseOriginTimestamp);
 
   log_received("Follow Up", &follow_up.header, clock_id, &follow_up.preciseOriginTimestamp);
+
+  clock_source_follow_up(daemon, clock_id, &follow_up.header, &follow_up.preciseOriginTimestamp);
 }
 
 static void
@@ -580,6 +755,13 @@ delay_msg_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, un
 static void
 announce_handle(struct airptp_daemon *daemon, uint8_t *req, ssize_t req_len, union utils_net_sockaddr *peer_addr, socklen_t peer_addr_len)
 {
+  if (req_len >= sizeof(struct ptp_announce_message))
+    {
+      uint64_t announcer_id;
+      header_read(&(struct ptp_header){ 0 }, &announcer_id, req);
+      clock_source_announce(daemon, announcer_id, be64toh(((struct ptp_announce_message *)req)->grandmasterIdentity));
+    }
+
 #if AIRPTP_LOG_RECEIVED
   struct ptp_announce_message *in = (struct ptp_announce_message *)req;
   struct ptp_announce_message announce = { 0 };
@@ -977,7 +1159,7 @@ ptp_msg_peer_del_send(struct airptp_peer *peer, struct airptp_handle *hdl, unsig
 /* ----------------------------- Message handler ---------------------------- */
 
 void
-ptp_msg_handle(struct airptp_daemon *daemon, uint8_t *msg, size_t msg_len, union utils_net_sockaddr *peer_addr, socklen_t peer_addrlen)
+ptp_msg_handle(struct airptp_daemon *daemon, uint8_t *msg, size_t msg_len, union utils_net_sockaddr *peer_addr, socklen_t peer_addrlen, uint64_t rx_ns)
 {
   uint8_t msg_type = msg[0] & 0x0F; // Only lower bits are message type
 
@@ -987,7 +1169,7 @@ ptp_msg_handle(struct airptp_daemon *daemon, uint8_t *msg, size_t msg_len, union
 	announce_handle(daemon, msg, msg_len, peer_addr, peer_addrlen);
 	break;
       case PTP_MSGTYPE_SYNC:
-	sync_handle(daemon, msg, msg_len, peer_addr, peer_addrlen);
+	sync_handle(daemon, msg, msg_len, peer_addr, peer_addrlen, rx_ns);
 	break;
       case PTP_MSGTYPE_FOLLOW_UP:
 	follow_up_handle(daemon, msg, msg_len, peer_addr, peer_addrlen);

@@ -28,6 +28,8 @@ SOFTWARE.
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <sys/types.h>
+#include <sys/socket.h>
 
 // For shm_open
 #include <sys/mman.h>
@@ -127,6 +129,17 @@ airptp_daemon_bind(const char *node)
 
   hdl->daemon.event_svc.port = airptp_event_port;
   hdl->daemon.event_svc.socket = event_socket;
+
+  // Sync messages arrive on the event port, have the kernel stamp them
+#ifdef SO_TIMESTAMPNS
+  int yes = 1;
+  if (event_socket.fd4 >= 0 && setsockopt(event_socket.fd4, SOL_SOCKET, SO_TIMESTAMPNS, &yes, sizeof(yes)) < 0)
+    airptp_logmsg("Could not enable receive timestamps (ipv4): %s", strerror(errno));
+  if (event_socket.fd6 >= 0 && setsockopt(event_socket.fd6, SOL_SOCKET, SO_TIMESTAMPNS, &yes, sizeof(yes)) < 0)
+    airptp_logmsg("Could not enable receive timestamps (ipv6): %s", strerror(errno));
+#endif
+
+  pthread_mutex_init(&hdl->daemon.clock_sources_lck, NULL);
 
   hdl->daemon.general_svc.port = airptp_general_port;
   hdl->daemon.general_svc.socket = general_socket;
@@ -284,6 +297,7 @@ airptp_end(struct airptp_handle *hdl)
     daemon_stop(&hdl->daemon);
     utils_net_socket_close(&hdl->daemon.event_svc.socket);
     utils_net_socket_close(&hdl->daemon.general_svc.socket);
+    pthread_mutex_destroy(&hdl->daemon.clock_sources_lck);
   }
 
   free(hdl);
@@ -297,6 +311,59 @@ airptp_clock_id_get(uint64_t *clock_id, struct airptp_handle *hdl)
 
   *clock_id = hdl->daemon_info.clock_id;
   return 0;
+}
+
+int
+airptp_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id, struct airptp_handle *hdl)
+{
+  struct airptp_clock_source *src;
+  struct airptp_clock_source *found = NULL;
+  int i;
+
+  if (!hdl || !hdl->is_daemon || hdl->state != AIRPTP_STATE_RUNNING)
+    return -1;
+
+  pthread_mutex_lock(&hdl->daemon.clock_sources_lck);
+  for (i = 0; i < AIRPTP_MAX_CLOCK_SOURCES; i++)
+    {
+      src = &hdl->daemon.clock_sources[i];
+      if (!src->in_use || !src->offset_valid)
+	continue;
+      if (clock_id && src->clock_id == clock_id)
+	{
+	  found = src;
+	  break;
+	}
+      if (!clock_id && (!found || src->updated_ns > found->updated_ns))
+	found = src;
+    }
+  if (found)
+    ptp_msg_clock_info_fill(info, found);
+  pthread_mutex_unlock(&hdl->daemon.clock_sources_lck);
+
+  return found ? 0 : -1;
+}
+
+int
+airptp_clocks_get(struct airptp_clock_info *info, int max, struct airptp_handle *hdl)
+{
+  struct airptp_clock_source *src;
+  int n = 0;
+  int i;
+
+  if (!hdl || !hdl->is_daemon || hdl->state != AIRPTP_STATE_RUNNING)
+    return 0;
+
+  pthread_mutex_lock(&hdl->daemon.clock_sources_lck);
+  for (i = 0; i < AIRPTP_MAX_CLOCK_SOURCES && n < max; i++)
+    {
+      src = &hdl->daemon.clock_sources[i];
+      if (src->in_use && src->offset_valid)
+	ptp_msg_clock_info_fill(&info[n++], src);
+    }
+  pthread_mutex_unlock(&hdl->daemon.clock_sources_lck);
+
+  return n;
 }
 
 const char *

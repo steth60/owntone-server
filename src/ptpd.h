@@ -7,6 +7,14 @@ ptpd_clock_id_get(void);
 int
 ptpd_slave_add(uint32_t *slave_id, const char *addr);
 
+struct airptp_clock_info;
+
+// Clock following: estimate for a remote master clock (e.g. an AirPlay sender
+// when we are the receiver), see airptp_clock_info_get(). clock_id 0 gives the
+// most recently updated clock.
+int
+ptpd_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id);
+
 void
 ptpd_slave_remove(uint32_t slave_id);
 
