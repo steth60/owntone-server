@@ -137,6 +137,7 @@ enum data_kind {
   DATA_KIND_HTTP = 1,    /* network stream (radio) */
   DATA_KIND_SPOTIFY = 2, /* iTunes has no spotify data kind, but we use 2 */
   DATA_KIND_PIPE = 3,    /* iTunes has no pipe data kind, but we use 3 */
+  DATA_KIND_AIRPLAY = 4, /* stream from a sender to our AirPlay receiver */
 };
 
 const char *

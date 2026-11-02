@@ -65,6 +65,9 @@
 #include <event2/bufferevent.h>
 #include <event2/listener.h>
 #include <gcrypt.h>
+#include <sodium.h>
+#include <libavcodec/avcodec.h>
+#include <libavutil/channel_layout.h>
 
 #include "outputs/plist_wrap.h"
 #include "pair_ap/pair.h"
@@ -75,6 +78,10 @@
 #include "misc.h"
 #include "mdns.h"
 #include "commands.h"
+#include "db.h"
+#include "input.h"
+#include "outputs.h"
+#include "player.h"
 #include "ptpd.h"
 #include "libairptp/airptp.h"
 
@@ -91,6 +98,16 @@
 #define RX_INITIAL_VOLUME       -24.0
 
 #define RX_HEADER_MAX           65536
+#define RX_QUEUE_MAX_BYTES      (16 * 1024 * 1024)
+#define RX_SEQ_MASK             0x7FFFFF
+
+// Format of a buffered audio packet, given by its SSRC field (as in Shairport
+// Sync). OwnTone's own buffered sender uses RX_SSRC_AAC_44100 too.
+#define RX_SSRC_NONE            0x00000000
+#define RX_SSRC_ALAC_48000_S24  0x15000000
+#define RX_SSRC_AAC_44100       0x16000000
+#define RX_SSRC_AAC_48000       0x17000000
+#define RX_AAC_FRAME_SAMPLES    1024
 #define RX_BODY_MAX             (4 * 1024 * 1024)
 #define RX_UUID_LEN             37
 #define RX_ADDR_LEN             (INET6_ADDRSTRLEN + 8)
@@ -178,6 +195,55 @@ struct rx_response
   uint8_t *body;
   size_t body_len;
 };
+
+struct rx_packet
+{
+  uint32_t seq;
+  uint32_t rtptime;
+  uint32_t ssrc;
+  uint8_t *data; // Decrypted AAC frame
+  size_t len;
+  struct rx_packet *next;
+};
+
+// The audio stream from the current sender. Written by the receiver thread,
+// read by the player's input thread (see the input at the end of this file).
+struct rx_stream
+{
+  pthread_mutex_t lck;
+
+  bool active;
+  bool ended;
+  int session_id;
+  char *client_name;
+  uint8_t key[32];
+  bool has_key;
+
+  struct rx_packet *head;
+  struct rx_packet *tail;
+  size_t queued_bytes;
+
+  // Changes whenever the input must find its place again (new anchor, flush)
+  uint32_t generation;
+  bool anchor_valid;
+  uint64_t rate;
+  uint32_t anchor_rtptime;
+  uint64_t anchor_local_ns;
+
+  // Packets up to (not including) this sequence number are dropped on arrival
+  bool flush_active;
+  uint32_t flush_until_seq;
+  // Deferred flush of a range further ahead
+  bool flush_range_active;
+  uint32_t flush_from_seq;
+
+  uint64_t packets_in;
+  uint64_t packets_bad;
+  uint64_t packets_dropped;
+};
+
+static struct rx_stream rx_stream = { .lck = PTHREAD_MUTEX_INITIALIZER };
+static uint32_t rx_queue_item_id;
 
 static bool rx_enabled;
 static struct event_base *evbase_rx;
@@ -568,6 +634,9 @@ service_tcp_event_cb(struct bufferevent *bev, short events, void *arg)
 }
 
 static void
+buffered_read_cb(struct bufferevent *bev, void *arg);
+
+static void
 service_accept_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *address, int socklen, void *arg)
 {
   struct rx_service *svc = arg;
@@ -586,7 +655,10 @@ service_accept_cb(struct evconnlistener *listener, evutil_socket_t fd, struct so
       return;
     }
 
-  bufferevent_setcb(svc->bev, service_tcp_read_cb, NULL, service_tcp_event_cb, svc);
+  if (svc->kind == RX_SERVICE_DATA && svc->session->stream_type == 103)
+    bufferevent_setcb(svc->bev, buffered_read_cb, NULL, service_tcp_event_cb, svc);
+  else
+    bufferevent_setcb(svc->bev, service_tcp_read_cb, NULL, service_tcp_event_cb, svc);
   bufferevent_enable(svc->bev, EV_READ);
 }
 
@@ -665,6 +737,397 @@ session_streams_stop(struct rx_session *s)
 }
 
 
+/* ------------------------------ Audio stream ------------------------------- */
+/*                 Receiver thread writes, input thread reads                   */
+
+static inline uint32_t
+be32_get(const uint8_t *p)
+{
+  return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
+}
+
+// Sequence numbers are 23 bit and wrap
+static inline bool
+seq_before(uint32_t a, uint32_t b)
+{
+  uint32_t diff = (a - b) & RX_SEQ_MASK;
+  return diff != 0 && diff >= 0x400000;
+}
+
+static int
+ssrc_sample_rate(uint32_t ssrc)
+{
+  return (ssrc == RX_SSRC_AAC_48000 || ssrc == RX_SSRC_ALAC_48000_S24) ? 48000 : 44100;
+}
+
+static void
+packet_free(struct rx_packet *pkt)
+{
+  if (!pkt)
+    return;
+  free(pkt->data);
+  free(pkt);
+}
+
+// Caller must hold rx_stream.lck
+static void
+stream_drop_head_locked(void)
+{
+  struct rx_packet *pkt = rx_stream.head;
+
+  if (!pkt)
+    return;
+
+  rx_stream.head = pkt->next;
+  if (!rx_stream.head)
+    rx_stream.tail = NULL;
+  rx_stream.queued_bytes -= pkt->len;
+  packet_free(pkt);
+}
+
+// Caller must hold rx_stream.lck
+static void
+stream_clear_locked(void)
+{
+  while (rx_stream.head)
+    stream_drop_head_locked();
+
+  rx_stream.anchor_valid = false;
+  rx_stream.flush_active = false;
+  rx_stream.flush_range_active = false;
+  rx_stream.generation++;
+}
+
+static void
+stream_start(struct rx_session *s, const uint8_t *key, size_t key_len)
+{
+  pthread_mutex_lock(&rx_stream.lck);
+
+  stream_clear_locked();
+  rx_stream.active = true;
+  rx_stream.ended = false;
+  rx_stream.session_id = s->id;
+  free(rx_stream.client_name);
+  rx_stream.client_name = s->client_name ? strdup(s->client_name) : NULL;
+  rx_stream.has_key = (key_len == sizeof(rx_stream.key));
+  if (rx_stream.has_key)
+    memcpy(rx_stream.key, key, sizeof(rx_stream.key));
+  rx_stream.rate = 0;
+  rx_stream.packets_in = 0;
+  rx_stream.packets_bad = 0;
+  rx_stream.packets_dropped = 0;
+
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  if (!rx_stream.has_key)
+    DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: stream SETUP without a valid session key, audio can't be decrypted\n", s->id);
+}
+
+static void
+stream_end(int session_id, const char *why)
+{
+  pthread_mutex_lock(&rx_stream.lck);
+
+  if (rx_stream.active && rx_stream.session_id == session_id)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: audio stream ended (%s), %" PRIu64 " packets in, %" PRIu64 " undecryptable, %" PRIu64 " dropped\n",
+	      session_id, why, rx_stream.packets_in, rx_stream.packets_bad, rx_stream.packets_dropped);
+      stream_clear_locked();
+      rx_stream.active = false;
+      rx_stream.ended = true;
+      sodium_memzero(rx_stream.key, sizeof(rx_stream.key));
+      rx_stream.has_key = false;
+    }
+
+  pthread_mutex_unlock(&rx_stream.lck);
+}
+
+static void
+stream_anchor_set(uint64_t rate, bool has_anchor, uint32_t rtptime, uint64_t local_ns)
+{
+  pthread_mutex_lock(&rx_stream.lck);
+
+  rx_stream.rate = rate;
+  if (has_anchor)
+    {
+      rx_stream.anchor_valid = true;
+      rx_stream.anchor_rtptime = rtptime;
+      rx_stream.anchor_local_ns = local_ns;
+      rx_stream.generation++;
+    }
+
+  pthread_mutex_unlock(&rx_stream.lck);
+}
+
+// Without from_seq: drop everything before until_seq, now and on arrival.
+// With from_seq: drop the range [from_seq, until_seq) when it arrives (the
+// sender does this to skip ahead while the current audio plays on).
+static void
+stream_flush(bool has_from, uint32_t from_seq, uint32_t until_seq)
+{
+  struct rx_packet *prev = NULL;
+  struct rx_packet *pkt;
+  struct rx_packet *next;
+
+  pthread_mutex_lock(&rx_stream.lck);
+
+  if (!has_from)
+    {
+      while (rx_stream.head && seq_before(rx_stream.head->seq, until_seq))
+	{
+	  stream_drop_head_locked();
+	  rx_stream.packets_dropped++;
+	}
+
+      rx_stream.flush_active = true;
+      rx_stream.flush_until_seq = until_seq;
+      rx_stream.anchor_valid = false; // A new anchor will follow
+      rx_stream.generation++;
+    }
+  else
+    {
+      for (pkt = rx_stream.head; pkt; pkt = next)
+	{
+	  next = pkt->next;
+	  if (seq_before(pkt->seq, from_seq) || !seq_before(pkt->seq, until_seq))
+	    {
+	      prev = pkt;
+	      continue;
+	    }
+
+	  if (prev)
+	    prev->next = next;
+	  else
+	    rx_stream.head = next;
+	  if (rx_stream.tail == pkt)
+	    rx_stream.tail = prev;
+	  rx_stream.queued_bytes -= pkt->len;
+	  rx_stream.packets_dropped++;
+	  packet_free(pkt);
+	}
+
+      rx_stream.flush_range_active = true;
+      rx_stream.flush_from_seq = from_seq;
+      rx_stream.flush_until_seq = until_seq;
+    }
+
+  pthread_mutex_unlock(&rx_stream.lck);
+}
+
+// Caller must hold rx_stream.lck. Returns true if the packet must be dropped
+static bool
+stream_flush_check_locked(uint32_t seq)
+{
+  if (rx_stream.flush_active)
+    {
+      if (seq_before(seq, rx_stream.flush_until_seq))
+	return true;
+      rx_stream.flush_active = false;
+    }
+
+  if (rx_stream.flush_range_active)
+    {
+      if (!seq_before(seq, rx_stream.flush_until_seq))
+	rx_stream.flush_range_active = false;
+      else if (!seq_before(seq, rx_stream.flush_from_seq))
+	return true;
+    }
+
+  return false;
+}
+
+// A buffered audio packet: 4 bytes marker + 23 bit sequence number, 4 bytes
+// RTP timestamp, 4 bytes SSRC (the format), then the ChaCha20-Poly1305
+// ciphertext with its 16 byte tag, then the last 8 bytes of the 12 byte
+// nonce. The timestamp and SSRC are the additional authenticated data.
+static void
+stream_packet_add(const uint8_t *p, size_t len)
+{
+  struct rx_packet *pkt;
+  uint8_t nonce[12] = { 0 };
+  unsigned long long plain_len = 0;
+  uint32_t seq;
+  uint32_t ssrc;
+  int ret;
+
+  if (len < 12 + crypto_aead_chacha20poly1305_ietf_ABYTES + 8)
+    return;
+
+  seq = be32_get(p) & RX_SEQ_MASK;
+  ssrc = be32_get(p + 8);
+  if (ssrc == RX_SSRC_NONE)
+    return; // Filler between formats, no audio
+
+  pthread_mutex_lock(&rx_stream.lck);
+
+  rx_stream.packets_in++;
+
+  if (!rx_stream.active || !rx_stream.has_key)
+    goto drop;
+  if (stream_flush_check_locked(seq))
+    goto drop;
+
+  CHECK_NULL(L_AIRPLAY_RX, pkt = calloc(1, sizeof(struct rx_packet)));
+  CHECK_NULL(L_AIRPLAY_RX, pkt->data = malloc(len));
+  memcpy(nonce + 4, p + len - 8, 8);
+
+  ret = crypto_aead_chacha20poly1305_ietf_decrypt(pkt->data, &plain_len, NULL, p + 12, len - 12 - 8, p + 4, 8, nonce, rx_stream.key);
+  if (ret != 0)
+    {
+      if (rx_stream.packets_bad++ < 5)
+	DPRINTF(E_LOG, L_AIRPLAY_RX, "Could not decrypt audio packet seq %u (%zu bytes)\n", seq, len);
+      packet_free(pkt);
+      pthread_mutex_unlock(&rx_stream.lck);
+      return;
+    }
+
+  pkt->seq = seq;
+  pkt->rtptime = be32_get(p + 4);
+  pkt->ssrc = ssrc;
+  pkt->len = plain_len;
+
+  if (rx_stream.tail)
+    rx_stream.tail->next = pkt;
+  else
+    rx_stream.head = pkt;
+  rx_stream.tail = pkt;
+  rx_stream.queued_bytes += pkt->len;
+
+  // The sender respects the audioBufferSize we gave it, so this is only a
+  // safeguard for when nobody plays the stream
+  while (rx_stream.queued_bytes > RX_QUEUE_MAX_BYTES)
+    {
+      stream_drop_head_locked();
+      rx_stream.packets_dropped++;
+    }
+
+  pthread_mutex_unlock(&rx_stream.lck);
+  return;
+
+ drop:
+  rx_stream.packets_dropped++;
+  pthread_mutex_unlock(&rx_stream.lck);
+}
+
+static void
+buffered_read_cb(struct bufferevent *bev, void *arg)
+{
+  struct rx_service *svc = arg;
+  struct evbuffer *input = bufferevent_get_input(bev);
+  uint8_t hdr[2];
+  uint8_t *p;
+  size_t len;
+
+  for (;;)
+    {
+      if (evbuffer_copyout(input, hdr, 2) < 2)
+	break;
+
+      // Length includes the two length bytes
+      len = ((size_t)hdr[0] << 8) | hdr[1];
+      if (len < 2)
+	{
+	  evbuffer_drain(input, 2);
+	  continue;
+	}
+      if (evbuffer_get_length(input) < len)
+	break;
+
+      p = evbuffer_pullup(input, len);
+      stream_packet_add(p + 2, len - 2);
+      evbuffer_drain(input, len);
+
+      svc->bytes += len;
+      svc->packets++;
+    }
+}
+
+static void
+playback_autostart(struct rx_session *s)
+{
+  struct player_status status;
+  struct media_file_info mfi = { 0 };
+  struct db_queue_item qi;
+  struct db_queue_item *queue_item;
+  struct db_queue_add_info queue_add_info;
+  const char *sender = s->client_name ? s->client_name : s->peer_addr;
+  int ret;
+
+  ret = player_get_status(&status);
+  if (ret == 0 && rx_queue_item_id && status.item_id == rx_queue_item_id && status.status != PLAY_STOPPED)
+    return; // Already ours
+
+  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: starting playback of the AirPlay stream from '%s'\n", s->id, sender);
+
+  mfi.path = safe_asprintf("airplay://%s", rx_device_id_raop);
+  mfi.virtual_path = safe_asprintf("/%s", mfi.path);
+  mfi.fname = strdup(rx_name);
+  mfi.title = safe_asprintf("AirPlay from %s", sender);
+  mfi.artist = strdup(sender);
+  mfi.album = strdup(rx_name);
+  mfi.type = strdup("aac");
+  mfi.codectype = strdup("mp4a");
+  mfi.description = strdup("AirPlay 2 stream");
+  mfi.data_kind = DATA_KIND_AIRPLAY;
+  mfi.media_kind = MEDIA_KIND_MUSIC;
+  mfi.time_modified = time(NULL);
+
+  db_queue_item_from_mfi(&qi, &mfi);
+
+  // Like pipe autostart, the stream replaces what was queued
+  player_playback_stop();
+  db_queue_clear(0);
+
+  ret = db_queue_add_start(&queue_add_info, -1);
+  if (ret == 0)
+    {
+      ret = db_queue_add_next(&queue_add_info, &qi);
+      ret = db_queue_add_end(&queue_add_info, 0, 0, ret);
+    }
+
+  free_queue_item(&qi, 1);
+  free_mfi(&mfi, 1);
+
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not add the AirPlay stream to the queue\n", s->id);
+      return;
+    }
+
+  queue_item = db_queue_fetch_byitemid(queue_add_info.new_item_id);
+  if (!queue_item)
+    return;
+
+  ret = player_playback_start_byitem(queue_item);
+  free_queue_item(queue_item, 0);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: could not start playback of the AirPlay stream\n", s->id);
+      return;
+    }
+
+  rx_queue_item_id = queue_add_info.new_item_id;
+}
+
+// Sender volume is in dB, -30 to 0, and -144 for mute (same mapping as the
+// pipe input uses for Shairport's pvol)
+static void
+volume_apply(struct rx_session *s, float airplay_volume)
+{
+  int volume;
+
+  if ((int)airplay_volume == -144)
+    volume = 0;
+  else if (airplay_volume >= -30.0 && airplay_volume <= 0.0)
+    volume = (int)(100.0 + (airplay_volume / 30.0 * 100.0));
+  else
+    return;
+
+  DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: sender volume %.2f dB, setting volume %d\n", s->id, airplay_volume, volume);
+  player_volume_set(volume);
+}
+
+
 /* ------------------------------- Sessions ---------------------------------- */
 
 static void
@@ -687,6 +1150,7 @@ session_free(struct rx_session *s)
 
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d from %s (%s) closed\n", s->id, s->peer_addr, s->client_name ? s->client_name : "unknown sender");
 
+  stream_end(s->id, "sender disconnected");
   session_streams_stop(s);
   service_free(s->event_svc);
 
@@ -1185,7 +1649,6 @@ handle_setup_streams(struct rx_session *s, struct rx_request *req, struct rx_res
   item = plist_dict_get_item(stream, "shk");
   if (item && plist_get_node_type(item) == PLIST_DATA)
     plist_get_data_val(item, &shk, &shk_len);
-  free(shk); // Kept for phase 3 (audio decryption), not needed yet
 
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: stream SETUP type %" PRIu64 " (%s), ct %" PRIu64 ", spf %" PRIu64 ", sr %" PRIu64 ", audioFormat 0x%" PRIx64 ", session key %" PRIu64 " bytes\n",
 	  s->id, type, type == 96 ? "realtime" : type == 103 ? "buffered" : type == 130 ? "remote control" : "unknown",
@@ -1193,6 +1656,14 @@ handle_setup_streams(struct rx_session *s, struct rx_request *req, struct rx_res
 
   session_streams_stop(s);
   s->stream_type = type;
+
+  if (type == 103)
+    stream_start(s, (uint8_t *)shk, shk_len);
+  if (shk)
+    {
+      sodium_memzero(shk, shk_len);
+      free(shk);
+    }
 
   switch (type)
     {
@@ -1263,11 +1734,13 @@ handle_teardown(struct rx_session *s, struct rx_request *req, struct rx_response
   if (req->plist && plist_dict_get_item(req->plist, "streams"))
     {
       DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: TEARDOWN of the audio stream\n", s->id);
+      stream_end(s->id, "TEARDOWN");
       session_streams_stop(s);
       return;
     }
 
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: TEARDOWN of the session\n", s->id);
+  stream_end(s->id, "TEARDOWN");
   session_streams_stop(s);
   service_free(s->event_svc);
   s->event_svc = NULL;
@@ -1299,6 +1772,8 @@ handle_set_parameter(struct rx_session *s, struct rx_request *req, struct rx_res
       text[len] = '\0';
       text[strcspn(text, "\r\n")] = '\0';
       DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: SET_PARAMETER %s\n", s->id, text);
+      if (strncmp(text, "volume:", 7) == 0)
+	volume_apply(s, strtof(text + 7, NULL));
     }
   else
     DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: SET_PARAMETER %s, %zu bytes\n", s->id, ctype ? ctype : "(no type)", req->body_len);
@@ -1358,6 +1833,7 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
     {
       // Rate change only (pause), no new anchor
       DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", no anchor\n", s->id, rate);
+      stream_anchor_set(rate, false, 0, 0);
       return;
     }
 
@@ -1367,9 +1843,13 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
 
   if (ptpd_clock_info_get(&ci, timeline_id) < 0)
     {
+      // Can't place the anchor on our clock, so play as soon as possible
       s->anchor_valid = false;
-      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 " at %" PRIu64 ".%09" PRIu64 " on clock %" PRIx64 ", which we are not following\n",
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 " at %" PRIu64 ".%09" PRIu64 " on clock %" PRIx64 ", which we are not following, playing unsynchronised\n",
 	      s->id, rate, rtptime, (uint64_t)(remote_ns / 1000000000ULL), (uint64_t)(remote_ns % 1000000000ULL), timeline_id);
+      stream_anchor_set(rate, true, (uint32_t)rtptime, now_ns() + outputs_buffer_duration_ms_get() * 1000000ULL);
+      if (rate)
+	playback_autostart(s);
       return;
     }
 
@@ -1380,6 +1860,31 @@ handle_setrateanchortime(struct rx_session *s, struct rx_request *req, struct rx
 
   DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: SETRATEANCHORTIME rate %" PRIu64 ", rtpTime %" PRIu64 " plays %" PRIi64 " ms %s (sender clock %" PRIx64 ", jitter %.1f us, drift %+.2f ppm)\n",
 	  s->id, rate, rtptime, (int64_t)llabs(ahead_ms), ahead_ms >= 0 ? "from now" : "ago", timeline_id, ci.jitter_us, ci.drift_ppm);
+
+  stream_anchor_set(rate, true, s->anchor_rtptime, s->anchor_local_ns);
+  if (rate)
+    playback_autostart(s);
+}
+
+static void
+handle_flushbuffered(struct rx_session *s, struct rx_request *req, struct rx_response *resp)
+{
+  uint64_t from_seq = 0;
+  uint64_t until_seq = 0;
+  bool has_from;
+
+  if (!req->plist || plist_dict_get_uint_val(req->plist, "flushUntilSeq", &until_seq) < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: FLUSHBUFFERED without flushUntilSeq, ignored\n", s->id);
+      return;
+    }
+
+  has_from = (plist_dict_get_uint_val(req->plist, "flushFromSeq", &from_seq) == 0);
+
+  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: FLUSHBUFFERED %s seq %" PRIu64 " until %" PRIu64 "\n", s->id,
+	  has_from ? "from" : "everything before", has_from ? from_seq : until_seq, until_seq);
+
+  stream_flush(has_from, (uint32_t)from_seq, (uint32_t)until_seq);
 }
 
 static void
@@ -1434,7 +1939,9 @@ request_handle(struct rx_session *s, struct rx_request *req)
       DPRINTF(E_INFO, L_AIRPLAY_RX, "Connection %d: %s %s\n", s->id, req->method, str ? str : "");
       free(str);
     }
-  else if (strcmp(req->method, "FLUSHBUFFERED") == 0 || strcmp(req->method, "FLUSH") == 0 || strcmp(req->method, "SETRATE") == 0 ||
+  else if (strcmp(req->method, "FLUSHBUFFERED") == 0)
+    handle_flushbuffered(s, req, &resp);
+  else if (strcmp(req->method, "FLUSH") == 0 || strcmp(req->method, "SETRATE") == 0 ||
 	   strcmp(req->method, "PAUSE") == 0)
     ; // Accept, playback control comes in phase 3
   else
@@ -1570,7 +2077,13 @@ airplay_receiver(void *arg)
 {
   thread_setname("airplayrx");
 
+  // Autostart adds the stream to the queue
+  if (db_perthread_init() < 0)
+    DPRINTF(E_LOG, L_AIRPLAY_RX, "Could not init database access, autostart won't work\n");
+
   event_base_dispatch(evbase_rx);
+
+  db_perthread_deinit();
 
   if (rx_enabled)
     DPRINTF(E_INFO, L_AIRPLAY_RX, "AirPlay receiver event loop terminated\n");
@@ -1710,3 +2223,363 @@ airplay_receiver_deinit(void)
   event_base_free(evbase_rx);
   evbase_rx = NULL;
 }
+
+
+/* ---------------------------------- Input ---------------------------------- */
+/*                             Thread: input                                    */
+
+// How many packets (of 1024 samples) to decode per play() call
+#define RX_INPUT_PACKETS_PER_READ 4
+// Start writing when the first frame is due within this time
+#define RX_INPUT_START_MARGIN_NS 10000000LL
+
+struct rx_input_ctx
+{
+  AVCodecContext *dec;
+  AVPacket *pkt;
+  AVFrame *frame;
+  uint32_t ssrc;
+
+  uint32_t generation;
+  bool synced;
+  struct timespec sync_ts;
+  short pending_flags;
+
+  int16_t *pcm;
+  size_t pcm_samples;
+};
+
+static void
+decoder_close(struct rx_input_ctx *ctx)
+{
+  avcodec_free_context(&ctx->dec);
+  av_packet_free(&ctx->pkt);
+  av_frame_free(&ctx->frame);
+  ctx->ssrc = 0;
+}
+
+static int
+decoder_open(struct rx_input_ctx *ctx, struct input_source *source, uint32_t ssrc)
+{
+  const AVCodec *codec;
+  uint8_t asc[2];
+  int rate;
+  int idx;
+  int ret;
+
+  decoder_close(ctx);
+
+  if (ssrc != RX_SSRC_AAC_44100 && ssrc != RX_SSRC_AAC_48000)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Audio format 0x%08x not supported yet\n", ssrc);
+      return -1;
+    }
+
+  rate = ssrc_sample_rate(ssrc);
+  idx = (rate == 48000) ? 3 : 4;
+
+  codec = avcodec_find_decoder(AV_CODEC_ID_AAC);
+  if (!codec)
+    return -1;
+
+  CHECK_NULL(L_AIRPLAY_RX, ctx->dec = avcodec_alloc_context3(codec));
+  ctx->dec->sample_rate = rate;
+  av_channel_layout_default(&ctx->dec->ch_layout, 2);
+
+  // The packets are raw AAC-LC frames, so the decoder needs the
+  // AudioSpecificConfig: object type 2 (LC), frequency index, 2 channels
+  asc[0] = (2 << 3) | (idx >> 1);
+  asc[1] = ((idx & 1) << 7) | (2 << 3);
+  CHECK_NULL(L_AIRPLAY_RX, ctx->dec->extradata = av_mallocz(sizeof(asc) + AV_INPUT_BUFFER_PADDING_SIZE));
+  memcpy(ctx->dec->extradata, asc, sizeof(asc));
+  ctx->dec->extradata_size = sizeof(asc);
+
+  ret = avcodec_open2(ctx->dec, codec, NULL);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Could not open AAC decoder: %s\n", av_err2str(ret));
+      decoder_close(ctx);
+      return -1;
+    }
+
+  CHECK_NULL(L_AIRPLAY_RX, ctx->pkt = av_packet_alloc());
+  CHECK_NULL(L_AIRPLAY_RX, ctx->frame = av_frame_alloc());
+  ctx->ssrc = ssrc;
+
+  source->quality.sample_rate = rate;
+  source->quality.bits_per_sample = 16;
+  source->quality.channels = 2;
+
+  DPRINTF(E_INFO, L_AIRPLAY_RX, "Decoding AAC-LC %d Hz stereo\n", rate);
+  return 0;
+}
+
+static inline int16_t
+float_to_s16(float f)
+{
+  if (f >= 1.0f)
+    return INT16_MAX;
+  if (f <= -1.0f)
+    return INT16_MIN;
+  return (int16_t)(f * 32767.0f);
+}
+
+// Converts a decoded frame to interleaved 16 bit stereo
+static void
+frame_write(struct evbuffer *evbuf, struct rx_input_ctx *ctx, AVFrame *frame)
+{
+  int nch = frame->ch_layout.nb_channels;
+  int n = frame->nb_samples;
+  int i;
+  int c;
+  int src;
+
+  if (nch < 1 || n < 1)
+    return;
+
+  if ((size_t)n > ctx->pcm_samples)
+    {
+      free(ctx->pcm);
+      CHECK_NULL(L_AIRPLAY_RX, ctx->pcm = malloc(n * 2 * sizeof(int16_t)));
+      ctx->pcm_samples = n;
+    }
+
+  for (i = 0; i < n; i++)
+    {
+      for (c = 0; c < 2; c++)
+	{
+	  src = (c < nch) ? c : 0;
+	  switch (frame->format)
+	    {
+	      case AV_SAMPLE_FMT_FLTP:
+		ctx->pcm[2 * i + c] = float_to_s16(((float *)frame->data[src])[i]);
+		break;
+	      case AV_SAMPLE_FMT_FLT:
+		ctx->pcm[2 * i + c] = float_to_s16(((float *)frame->data[0])[i * nch + src]);
+		break;
+	      case AV_SAMPLE_FMT_S16P:
+		ctx->pcm[2 * i + c] = ((int16_t *)frame->data[src])[i];
+		break;
+	      case AV_SAMPLE_FMT_S16:
+		ctx->pcm[2 * i + c] = ((int16_t *)frame->data[0])[i * nch + src];
+		break;
+	      default:
+		ctx->pcm[2 * i + c] = 0;
+	    }
+	}
+    }
+
+  evbuffer_add(evbuf, ctx->pcm, n * 2 * sizeof(int16_t));
+}
+
+static void
+packet_decode(struct rx_input_ctx *ctx, struct input_source *source, struct rx_packet *pkt)
+{
+  int ret;
+
+  if (pkt->ssrc != ctx->ssrc && decoder_open(ctx, source, pkt->ssrc) < 0)
+    return;
+
+  av_packet_unref(ctx->pkt);
+  if (av_new_packet(ctx->pkt, pkt->len) < 0)
+    return;
+  memcpy(ctx->pkt->data, pkt->data, pkt->len);
+
+  ret = avcodec_send_packet(ctx->dec, ctx->pkt);
+  if (ret < 0)
+    {
+      DPRINTF(E_WARN, L_AIRPLAY_RX, "AAC decoder rejected packet seq %u: %s\n", pkt->seq, av_err2str(ret));
+      return;
+    }
+
+  while (avcodec_receive_frame(ctx->dec, ctx->frame) == 0)
+    {
+      frame_write(source->evbuf, ctx, ctx->frame);
+      av_frame_unref(ctx->frame);
+    }
+}
+
+static int
+rxin_setup(struct input_source *source)
+{
+  struct rx_input_ctx *ctx;
+
+  CHECK_NULL(L_AIRPLAY_RX, ctx = calloc(1, sizeof(struct rx_input_ctx)));
+  CHECK_NULL(L_AIRPLAY_RX, source->evbuf = evbuffer_new());
+
+  source->quality.sample_rate = 44100;
+  source->quality.bits_per_sample = 16;
+  source->quality.channels = 2;
+  source->input_ctx = ctx;
+
+  pthread_mutex_lock(&rx_stream.lck);
+  ctx->generation = rx_stream.generation;
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  return 0;
+}
+
+static int
+rxin_stop(struct input_source *source)
+{
+  struct rx_input_ctx *ctx = source->input_ctx;
+
+  if (ctx)
+    {
+      decoder_close(ctx);
+      free(ctx->pcm);
+      free(ctx);
+    }
+  if (source->evbuf)
+    evbuffer_free(source->evbuf);
+
+  source->input_ctx = NULL;
+  source->evbuf = NULL;
+  return 0;
+}
+
+static int
+rxin_play(struct input_source *source)
+{
+  struct rx_input_ctx *ctx = source->input_ctx;
+  struct rx_packet *batch = NULL;
+  struct rx_packet *pkt;
+  struct rx_packet *last;
+  short flags = ctx->pending_flags;
+  int64_t frame_offset;
+  int64_t audible_ns;
+  int64_t pts_ns;
+  int64_t now;
+  int n;
+  int ret;
+
+  pthread_mutex_lock(&rx_stream.lck);
+
+  if (!rx_stream.active)
+    {
+      pthread_mutex_unlock(&rx_stream.lck);
+      DPRINTF(E_INFO, L_AIRPLAY_RX, "AirPlay stream is gone, ending playback\n");
+      input_write(NULL, NULL, INPUT_FLAG_EOF);
+      return -1;
+    }
+
+  if (ctx->generation != rx_stream.generation)
+    {
+      ctx->generation = rx_stream.generation;
+      ctx->synced = false;
+    }
+
+  // Paused or waiting for the sender's anchor
+  if (!rx_stream.anchor_valid || rx_stream.rate == 0)
+    goto wait;
+
+  if (!ctx->synced)
+    {
+      // Skip what should already have played before the anchor
+      while (rx_stream.head && (int32_t)(rx_stream.head->rtptime + RX_AAC_FRAME_SAMPLES - rx_stream.anchor_rtptime) <= 0)
+	{
+	  stream_drop_head_locked();
+	  rx_stream.packets_dropped++;
+	}
+      if (!rx_stream.head)
+	goto wait;
+
+      // When the first frame must be audible, and so when it must leave the
+      // player, given the outputs' buffer
+      frame_offset = (int32_t)(rx_stream.head->rtptime - rx_stream.anchor_rtptime);
+      audible_ns = (int64_t)rx_stream.anchor_local_ns + frame_offset * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
+      pts_ns = audible_ns - (int64_t)outputs_buffer_duration_ms_get() * 1000000LL;
+      now = (int64_t)now_ns();
+
+      if (pts_ns > now + RX_INPUT_START_MARGIN_NS)
+	goto wait;
+
+      if (pts_ns < now)
+	{
+	  DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream %" PRIi64 " ms later than the sender asked for\n", (now - pts_ns) / 1000000);
+	  pts_ns = now;
+	}
+      else
+	DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream at the sender's anchor (seq %u, rtptime %u)\n", rx_stream.head->seq, rx_stream.head->rtptime);
+
+      ctx->sync_ts.tv_sec = pts_ns / 1000000000LL;
+      ctx->sync_ts.tv_nsec = pts_ns % 1000000000LL;
+      ctx->synced = true;
+      flags |= INPUT_FLAG_SYNC | INPUT_FLAG_METADATA;
+    }
+
+  // Take a few packets off the queue, decode them without holding the lock
+  for (n = 0, last = NULL; rx_stream.head && n < RX_INPUT_PACKETS_PER_READ; n++)
+    {
+      pkt = rx_stream.head;
+      rx_stream.head = pkt->next;
+      if (!rx_stream.head)
+	rx_stream.tail = NULL;
+      rx_stream.queued_bytes -= pkt->len;
+      pkt->next = NULL;
+      if (last)
+	last->next = pkt;
+      else
+	batch = pkt;
+      last = pkt;
+    }
+
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  if (!batch)
+    {
+      input_wait();
+      return 0;
+    }
+
+  while (batch)
+    {
+      pkt = batch;
+      batch = pkt->next;
+      packet_decode(ctx, source, pkt);
+      packet_free(pkt);
+    }
+
+  ret = input_write(source->evbuf, &source->quality, flags);
+  ctx->pending_flags = (ret == EAGAIN) ? flags : 0;
+  return 0;
+
+ wait:
+  pthread_mutex_unlock(&rx_stream.lck);
+  input_wait();
+  return 0;
+}
+
+static int
+rxin_ts_get(struct timespec *ts, struct input_source *source)
+{
+  struct rx_input_ctx *ctx = source->input_ctx;
+
+  if (!ctx || !ctx->synced)
+    return -1;
+
+  *ts = ctx->sync_ts;
+  return 0;
+}
+
+static int
+rxin_metadata_get(struct input_metadata *metadata, struct input_source *source)
+{
+  pthread_mutex_lock(&rx_stream.lck);
+  metadata->title = safe_asprintf("AirPlay from %s", rx_stream.client_name ? rx_stream.client_name : "a sender");
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  return 0;
+}
+
+struct input_definition input_airplay =
+{
+  .name = "AirPlay receiver",
+  .type = INPUT_TYPE_AIRPLAY,
+  .disabled = 0,
+  .setup = rxin_setup,
+  .play = rxin_play,
+  .stop = rxin_stop,
+  .ts_get = rxin_ts_get,
+  .metadata_get = rxin_metadata_get,
+};

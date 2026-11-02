@@ -585,7 +585,7 @@ db_media_kind_enum(const char *label)
 }
 
 /* Keep in sync with enum data_kind */
-static char *data_kind_label[] = { "file", "url", "spotify", "pipe" };
+static char *data_kind_label[] = { "file", "url", "spotify", "pipe", "airplay" };
 
 const char *
 db_data_kind_label(enum data_kind data_kind)

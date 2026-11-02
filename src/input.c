@@ -55,6 +55,7 @@ extern struct input_definition input_file;
 extern struct input_definition input_http;
 extern struct input_definition input_pipe;
 extern struct input_definition input_timer;
+extern struct input_definition input_airplay;
 #ifdef SPOTIFY_LIBRESPOTC
 extern struct input_definition input_spotify;
 #endif
@@ -68,6 +69,7 @@ static struct input_definition *inputs[] = {
     &input_http,
     &input_pipe,
     &input_timer,
+    &input_airplay,
 #ifdef SPOTIFY_LIBRESPOTC
     &input_spotify,
 #endif
@@ -173,6 +175,9 @@ map_data_kind(int data_kind)
 
       case DATA_KIND_PIPE:
 	return INPUT_TYPE_PIPE;
+
+      case DATA_KIND_AIRPLAY:
+	return INPUT_TYPE_AIRPLAY;
 
       case DATA_KIND_SPOTIFY:
 #ifdef SPOTIFY_LIBRESPOTC
