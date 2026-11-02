@@ -38,8 +38,9 @@
 #define L_WEB         29
 #define L_AIRPLAY     30
 #define L_RCP         31
+#define L_AIRPLAY_RX  32
 
-#define N_LOGDOMAINS  32
+#define N_LOGDOMAINS  33
 
 /* Severities */
 #define E_FATAL   0

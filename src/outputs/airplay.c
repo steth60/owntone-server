@@ -57,6 +57,7 @@
 
 #include "airplay_events.h"
 #include "pair_ap/pair.h"
+#include "airplay_receiver.h"
 
 /* List of TODO's for AirPlay 2
  *
@@ -4243,6 +4244,12 @@ airplay_device_cb(const char *name, const char *type, const char *domain, const 
     }
 
   DPRINTF(E_DBG, L_AIRPLAY, "Event for AirPlay device '%s' (port %d, id %" PRIx64 ", Active-Remote %" PRIu32 ")\n", name, port, id, (uint32_t)id);
+
+  if (airplay_receiver_is_self(name))
+    {
+      DPRINTF(E_DBG, L_AIRPLAY, "Ignoring AirPlay device '%s', it is our own receiver\n", name);
+      return;
+    }
 
   devcfg = cfg_gettsec(cfg, "airplay", name);
   if (devcfg && cfg_getbool(devcfg, "exclude"))

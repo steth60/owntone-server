@@ -321,6 +321,20 @@ audio {
 #	path = "/path/to/fifo"
 #}
 
+# AirPlay 2 receiver: OwnTone appears as an AirPlay speaker, so Music.app
+# or an iPhone can stream to it and OwnTone plays it on its own outputs.
+# Work in progress: currently the receiver pairs and accepts streams, but
+# does not play the audio yet.
+#airplay_receiver {
+#	enabled = false
+#	# Name shown to senders
+#	name = "OwnTone"
+#	port = 7000
+#	# Defaults to the MAC address of the first network interface. The
+#	# receiver's pairing key is derived from it, so keep it stable.
+#	device_id = "AA:BB:CC:DD:EE:FF"
+#}
+
 # AirPlay settings common to all devices
 #airplay_shared {
 	# UDP ports used when Airplay 2 devices make connections to the server.

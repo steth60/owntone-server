@@ -66,6 +66,7 @@
 #include "mpd.h"
 #include "mdns.h"
 #include "remote_pairing.h"
+#include "airplay_receiver.h"
 #include "player.h"
 #include "worker.h"
 #include "library.h"
@@ -870,6 +871,16 @@ main(int argc, char **argv)
       mdns_cname("owntone.local");
     }
 
+  /* Start the AirPlay 2 receiver (if enabled), it registers its own mDNS services */
+  ret = airplay_receiver_init();
+  if (ret != 0)
+    {
+      DPRINTF(E_FATAL, L_MAIN, "AirPlay receiver failed to start\n");
+
+      ret = EXIT_FAILURE;
+      goto airplay_receiver_fail;
+    }
+
 #ifdef HAVE_SIGNALFD
   /* Set up signal fd */
   sigfd = signalfd(-1, &sigs, SFD_NONBLOCK | SFD_CLOEXEC);
@@ -948,6 +959,10 @@ main(int argc, char **argv)
 
  sig_event_fail:
  signalfd_fail:
+  DPRINTF(E_LOG, L_MAIN, "AirPlay receiver deinit\n");
+  airplay_receiver_deinit();
+
+ airplay_receiver_fail:
  mdns_reg_fail:
   DPRINTF(E_LOG, L_MAIN, "Remote pairing deinit\n");
   remote_pairing_deinit();

@@ -71,6 +71,7 @@
 #include "transcode.h"
 #include "outputs.h"
 #include "pair_ap/pair.h"
+#include "airplay_receiver.h"
 
 #define ALAC_HEADER_LEN                      3
 
@@ -4235,6 +4236,12 @@ raop_device_cb(const char *name, const char *type, const char *domain, const cha
   device_name++;
 
   DPRINTF(E_DBG, L_RAOP, "Event for AirPlay device '%s' (port %d, id %" PRIx64 ", Active-Remote %" PRIu32 ")\n", device_name, port, id, (uint32_t)id);
+
+  if (airplay_receiver_is_self(device_name))
+    {
+      DPRINTF(E_DBG, L_RAOP, "Ignoring AirPlay device '%s', it is our own receiver\n", device_name);
+      return;
+    }
 
   devcfg = cfg_gettsec(cfg, "airplay", device_name);
   if (devcfg && cfg_getbool(devcfg, "exclude"))

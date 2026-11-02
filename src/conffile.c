@@ -297,6 +297,16 @@ static cfg_opt_t sec_streaming[] =
     CFG_END()
   };
 
+/* AirPlay 2 receiver (OwnTone as an AirPlay target) */
+static cfg_opt_t sec_airplay_receiver[] =
+  {
+    CFG_BOOL("enabled", cfg_false, CFGF_NONE),
+    CFG_STR("name", "OwnTone", CFGF_NONE),
+    CFG_INT("port", 7000, CFGF_NONE),
+    CFG_STR("device_id", NULL, CFGF_NONE),
+    CFG_END()
+  };
+
 /* Config file structure */
 static cfg_opt_t toplvl_cfg[] =
   {
@@ -306,6 +316,7 @@ static cfg_opt_t toplvl_cfg[] =
     CFG_SEC("alsa", sec_alsa, CFGF_MULTI | CFGF_TITLE),
     CFG_SEC("airplay_shared", sec_airplay_shared, CFGF_NONE),
     CFG_SEC("airplay", sec_airplay, CFGF_MULTI | CFGF_TITLE),
+    CFG_SEC("airplay_receiver", sec_airplay_receiver, CFGF_NONE),
     CFG_SEC("chromecast", sec_chromecast, CFGF_MULTI | CFGF_TITLE),
     CFG_SEC("fifo", sec_fifo, CFGF_NONE),
     CFG_SEC("rcp", sec_rcp, CFGF_MULTI | CFGF_TITLE),
