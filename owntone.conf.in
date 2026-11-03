@@ -59,6 +59,12 @@ general {
 	# selected speakers/outputs are available)
 #	speaker_autoselect = no
 
+	# Speakers that appear while playing are normally not turned on, even if
+	# they were selected when OwnTone last saw them. Set this to rejoin them to
+	# the playback, e.g. when playback starts right after OwnTone starts (pipe
+	# autostart) and the speakers are only discovered a moment later.
+#	speaker_rejoin = no
+
 	# Most modern systems have a high-resolution clock, but if you are on an
 	# unusual platform and experience audio drop-outs, you can try changing
 	# this option

@@ -309,6 +309,7 @@ static int player_flush_pending;
 
 // Config values and player settings category
 static int speaker_autoselect;
+static bool speaker_rejoin;
 static int clear_queue_on_stop_disabled;
 
 // Player status
@@ -1388,21 +1389,60 @@ playback_cb(int fd, short what, void *arg)
 
 /* ----------------- Output device handling (add/remove etc) ---------------- */
 
+static void
+device_streaming_cb(struct output_device *device, enum output_device_state status);
+
+// Like device_activate_cb(), but for a device we start outside of a command
+static void
+device_rejoin_cb(struct output_device *device, enum output_device_state status)
+{
+  if (!device)
+    return;
+
+  if (status == OUTPUT_STATE_PASSWORD || status == OUTPUT_STATE_FAILED)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' could not rejoin playback\n", device->type_name, device->name);
+      outputs_device_deselect(device);
+    }
+  else
+    outputs_device_cb_set(device, device_streaming_cb);
+
+  status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
+}
+
 static enum command_state
 device_add(void *arg, int *retval)
 {
   union player_arg *cmdarg = arg;
   struct output_device *device = cmdarg->device;
+  struct output_device *existing;
+  bool is_new;
   bool new_deselect;
+  int ret;
 
-  // Never turn on new devices during playback
-  new_deselect = (player_state == PLAY_PLAYING);
+  // A device of another type with the same id is replaced (AirPlay 1 -> 2)
+  existing = outputs_device_get(device->id);
+  is_new = (!existing || existing->type != device->type);
+
+  // Never turn on new devices during playback, unless configured to rejoin
+  // devices that were selected when we last saw them
+  new_deselect = (player_state == PLAY_PLAYING) && !speaker_rejoin;
 
   device = outputs_device_add(device, new_deselect);
   if (!device)
     {
       *retval = -1;
       return COMMAND_END;
+    }
+
+  if (is_new && speaker_rejoin && player_state == PLAY_PLAYING && device->selected && !device->session)
+    {
+      DPRINTF(E_LOG, L_PLAYER, "The %s device '%s' was selected when last seen, rejoining playback\n", device->type_name, device->name);
+
+      outputs_device_select(device, outputs_volume_get());
+      ret = outputs_device_start(device, device_rejoin_cb, false);
+      if (ret < 0)
+	outputs_device_deselect(device);
     }
 
   status_update(player_state, LISTENER_SPEAKER | LISTENER_VOLUME);
@@ -3963,6 +4003,7 @@ player_init(void)
   int ret;
 
   speaker_autoselect = cfg_getbool(cfg_getsec(cfg, "general"), "speaker_autoselect");
+  speaker_rejoin = cfg_getbool(cfg_getsec(cfg, "general"), "speaker_rejoin");
   clear_queue_on_stop_disabled = cfg_getbool(cfg_getsec(cfg, "library"), "clear_queue_on_stop_disable");
 
   /* Handle deprecated config options, note that this is also in library.c */
