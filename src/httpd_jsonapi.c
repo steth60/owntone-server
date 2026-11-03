@@ -51,6 +51,11 @@
 #include "logger.h"
 #include "misc.h"
 #include "misc_json.h"
+#include "stats.h"
+#include "dsp.h"
+#include "ptpd.h"
+#include "libairptp/airptp.h"
+#include "airplay_receiver.h"
 #include "player.h"
 #include "remote_pairing.h"
 #include "settings.h"
@@ -1805,6 +1810,122 @@ jsonapi_reply_outputs_toggle_byid(struct httpd_request *hreq)
 /*
  * Endpoint "/api/outputs"
  */
+static int
+jsonapi_reply_stats(struct httpd_request *hreq)
+{
+  struct player_status status;
+  struct airptp_peer_info peers[32];
+  json_object *jreply;
+  json_object *speakers;
+  json_object *ptp;
+  json_object *jpeers;
+  json_object *peer;
+  char id[24];
+  int npeers;
+  int i;
+
+  jreply = json_object_new_object();
+
+  stats_json_add(jreply);
+
+  if (player_get_status(&status) == 0)
+    {
+      json_object *player;
+
+      if (json_object_object_get_ex(jreply, "player", &player))
+	{
+	  json_object_object_add(player, "state", json_object_new_string(status.status == PLAY_PLAYING ? "play" : status.status == PLAY_PAUSED ? "pause" : "stop"));
+	  json_object_object_add(player, "volume", json_object_new_int(status.volume));
+	  json_object_object_add(player, "item_id", json_object_new_int64(status.item_id));
+	}
+    }
+
+  speakers = json_object_new_array();
+  player_speaker_enumerate(speaker_enum_cb, speakers);
+  json_object_object_add(jreply, "speakers", speakers);
+
+  ptp = json_object_new_object();
+  snprintf(id, sizeof(id), "%" PRIx64, ptpd_clock_id_get());
+  json_object_object_add(ptp, "clock_id", json_object_new_string(id));
+  jpeers = json_object_new_array();
+  npeers = ptpd_peers_get(peers, ARRAY_SIZE(peers));
+  for (i = 0; i < npeers; i++)
+    {
+      peer = json_object_new_object();
+      json_object_object_add(peer, "address", json_object_new_string(peers[i].address));
+      json_object_object_add(peer, "active", json_object_new_boolean(peers[i].is_active));
+      json_object_object_add(peer, "last_seen_s_ago", json_object_new_int64(time(NULL) - peers[i].last_seen));
+      json_object_array_add(jpeers, peer);
+    }
+  json_object_object_add(ptp, "peers", jpeers);
+  json_object_object_add(jreply, "ptp", ptp);
+
+  airplay_receiver_stats_json_add(jreply);
+
+  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(jreply)));
+
+  jparse_free(jreply);
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_outputs_eq_get(struct httpd_request *hreq)
+{
+  struct player_speaker_info speaker_info;
+  struct dsp_profile profile;
+  uint64_t output_id;
+  char *json;
+
+  if (safe_atou64(hreq->path_parts[2], &output_id) < 0 || player_speaker_get_byid(&speaker_info, output_id) < 0)
+    return HTTP_BADREQUEST;
+
+  dsp_profile_get(&profile, output_id);
+
+  json = dsp_profile_to_json(&profile);
+  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json));
+  free(json);
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_outputs_eq_put(struct httpd_request *hreq)
+{
+  struct player_speaker_info speaker_info;
+  struct dsp_profile profile;
+  uint64_t output_id;
+  size_t len;
+  char *body;
+  int ret;
+
+  if (safe_atou64(hreq->path_parts[2], &output_id) < 0 || player_speaker_get_byid(&speaker_info, output_id) < 0)
+    return HTTP_BADREQUEST;
+
+  len = evbuffer_get_length(hreq->in_body);
+  if (len == 0 || len > 16384)
+    return HTTP_BADREQUEST;
+
+  CHECK_NULL(L_WEB, body = calloc(1, len + 1));
+  evbuffer_copyout(hreq->in_body, body, len);
+
+  ret = dsp_profile_from_json(&profile, body);
+  free(body);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_WEB, "Invalid EQ profile for output %" PRIu64 "\n", output_id);
+      return HTTP_BADREQUEST;
+    }
+
+  ret = dsp_profile_set(&profile, output_id);
+  if (ret < 0)
+    return HTTP_INTERNAL;
+
+  DPRINTF(E_INFO, L_WEB, "EQ profile for '%s' %s\n", speaker_info.name, dsp_profile_is_neutral(&profile) ? "turned off" : "updated");
+
+  return HTTP_NOCONTENT;
+}
+
 static int
 jsonapi_reply_outputs(struct httpd_request *hreq)
 {
@@ -4693,6 +4814,9 @@ static struct httpd_uri_map adm_handlers[] =
     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
+    { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/eq$",               jsonapi_reply_outputs_eq_get },
+    { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/eq$",               jsonapi_reply_outputs_eq_put },
+    { HTTPD_METHOD_GET,    "^/api/stats$",                                 jsonapi_reply_stats },
     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_put_byid },
     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/toggle$",           jsonapi_reply_outputs_toggle_byid },
 

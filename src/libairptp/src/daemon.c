@@ -204,12 +204,14 @@ peer_last_seen_update(struct airptp_daemon *daemon, union utils_net_sockaddr *pe
 {
   int i;
 
+  pthread_mutex_lock(&daemon->clock_sources_lck);
   for (i = 0; i < daemon->num_peers; i++) {
     if (utils_net_address_is_same(peer_addr, &daemon->peers[i].naddr)) {
       daemon->peers[i].last_seen = time(NULL);
       break;
     }
   }
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
 }
 
 static bool
@@ -231,6 +233,8 @@ daemon_peer_add(struct airptp_daemon *daemon, struct airptp_peer *peer)
   char straddr[64];
   uint32_t scope_id;
 
+  pthread_mutex_lock(&daemon->clock_sources_lck);
+
   // Clean up dead peers
   peers_prune(daemon);
 
@@ -238,11 +242,13 @@ daemon_peer_add(struct airptp_daemon *daemon, struct airptp_peer *peer)
 
   if (daemon->num_peers >= AIRPTP_MAX_PEERS) {
     airptp_logmsg("Max number of PTP peers reached (num_peers %d), can't add %s", daemon->num_peers, straddr);
+    pthread_mutex_unlock(&daemon->clock_sources_lck);
     return -1;
   }
 
   if (peer_exists(daemon, peer)) {
     airptp_logmsg("PTP peer %s already in list, num_peers %d", straddr, daemon->num_peers);
+    pthread_mutex_unlock(&daemon->clock_sources_lck);
     return -1;
   }
 
@@ -250,6 +256,8 @@ daemon_peer_add(struct airptp_daemon *daemon, struct airptp_peer *peer)
   peer->is_active = true;
   memcpy(&daemon->peers[daemon->num_peers], peer, sizeof(struct airptp_peer));
   daemon->num_peers++;
+
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
 
   // Trigger announce and signaling immediately
   event_active(daemon->send_announce_timer, 0, 0);
@@ -272,6 +280,8 @@ daemon_peer_del(struct airptp_daemon *daemon, struct airptp_peer *peer)
   bool found;
   int i;
 
+  pthread_mutex_lock(&daemon->clock_sources_lck);
+
   for (i = 0, found = false; i < daemon->num_peers; i++)
     {
       peer = &daemon->peers[i];
@@ -287,12 +297,16 @@ daemon_peer_del(struct airptp_daemon *daemon, struct airptp_peer *peer)
 	daemon->peers[i - 1] = *peer;
     }
 
+  if (found)
+    daemon->num_peers--;
+
+  pthread_mutex_unlock(&daemon->clock_sources_lck);
+
   if (!found) {
     airptp_logmsg("Can't remove PTP peer, not in our list");
     return -1;
   }
 
-  daemon->num_peers--;
   airptp_logmsg("Removed peer id %" PRIu32 ", num_peers %d", peer_id, daemon->num_peers);
   return 0;
 }

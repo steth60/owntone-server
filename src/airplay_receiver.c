@@ -69,6 +69,8 @@
 #include <libavcodec/avcodec.h>
 #include <libavutil/channel_layout.h>
 
+#include <json.h>
+
 #include "outputs/plist_wrap.h"
 #include "pair_ap/pair.h"
 
@@ -2215,6 +2217,60 @@ mdns_register_all(void)
 
 
 /* ---------------------------------- API ------------------------------------ */
+
+void
+airplay_receiver_stats_json_add(struct json_object *obj)
+{
+  json_object *rx = json_object_new_object();
+  struct airptp_clock_info ci;
+  uint64_t clock_id = 0;
+  int64_t anchor_in_ms = 0;
+  bool anchored;
+
+  json_object_object_add(rx, "enabled", json_object_new_boolean(rx_enabled));
+  if (rx_enabled)
+    {
+      json_object_object_add(rx, "name", json_object_new_string(rx_name));
+      json_object_object_add(rx, "device_id", json_object_new_string(rx_device_id));
+    }
+
+  pthread_mutex_lock(&rx_stream.lck);
+  json_object_object_add(rx, "streaming", json_object_new_boolean(rx_stream.active));
+  if (rx_stream.client_name)
+    json_object_object_add(rx, "sender", json_object_new_string(rx_stream.client_name));
+  json_object_object_add(rx, "playing", json_object_new_boolean(rx_stream.active && rx_stream.rate > 0));
+  json_object_object_add(rx, "packets_in", json_object_new_int64(rx_stream.packets_in));
+  json_object_object_add(rx, "packets_undecryptable", json_object_new_int64(rx_stream.packets_bad));
+  json_object_object_add(rx, "packets_dropped", json_object_new_int64(rx_stream.packets_dropped));
+  json_object_object_add(rx, "queued_bytes", json_object_new_int64(rx_stream.queued_bytes));
+  anchored = rx_stream.anchor_valid;
+  if (anchored)
+    anchor_in_ms = ((int64_t)rx_stream.anchor_local_ns - (int64_t)now_ns()) / 1000000;
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  if (anchored)
+    json_object_object_add(rx, "anchor_age_ms", json_object_new_int64(-anchor_in_ms));
+
+  // The sender's clock, if we follow one
+  if (ptpd_clock_info_get(&ci, clock_id) == 0)
+    {
+      json_object *clk = json_object_new_object();
+      char id[24];
+
+      snprintf(id, sizeof(id), "%" PRIx64, ci.clock_id);
+      json_object_object_add(clk, "clock_id", json_object_new_string(id));
+      json_object_object_add(clk, "address", json_object_new_string(ci.address));
+      json_object_object_add(clk, "offset_ns", json_object_new_int64(ci.offset_ns));
+      json_object_object_add(clk, "updated_ms_ago", json_object_new_int64((int64_t)(now_ns() - ci.updated_ns) / 1000000));
+      json_object_object_add(clk, "jitter_us", json_object_new_double(ci.jitter_us));
+      json_object_object_add(clk, "drift_ppm", json_object_new_double(ci.drift_ppm));
+      json_object_object_add(clk, "samples", json_object_new_int64(ci.samples));
+      json_object_object_add(clk, "steps", json_object_new_int64(ci.steps));
+      json_object_object_add(rx, "sender_clock", clk);
+    }
+
+  json_object_object_add(obj, "receiver", rx);
+}
 
 bool
 airplay_receiver_is_self(const char *name)

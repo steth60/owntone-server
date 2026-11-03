@@ -77,6 +77,7 @@
 #include "settings.h"
 #include "misc.h"
 #include "player.h"
+#include "stats.h"
 #include "worker.h"
 #include "listener.h"
 #include "commands.h"
@@ -1020,6 +1021,7 @@ event_read_eof()
 static void
 event_read_error()
 {
+  stats_player_add(STATS_PLAYER_READ_ERRORS, 1);
   DPRINTF(E_DBG, L_PLAYER, "event_read_error()\n");
 
   db_queue_delete_byitemid(pb_session.reading_now->item_id);
@@ -1377,6 +1379,7 @@ playback_cb(int fd, short what, void *arg)
     {
       DPRINTF(E_LOG, L_PLAYER, "Source is not providing sufficient data, temporarily suspending playback (deficit=%zu/%zu bytes)\n",
 	pb_session.read_deficit, pb_session.read_deficit_max);
+      stats_player_add(STATS_PLAYER_UNDERRUNS, 1);
 
       player_flush_pending = pb_suspend();
       // No devices to wait for, just set the restart cb right away. Otherwise
@@ -2090,6 +2093,8 @@ playback_start_item(void *arg, int *retval)
   uint32_t seek_ms;
   int ret;
 
+  stats_player_add(STATS_PLAYER_STARTS, 1);
+
   if (player_state == PLAY_PLAYING)
     {
       DPRINTF(E_DBG, L_PLAYER, "Player is already playing, ignoring call to playback start\n");
@@ -2546,6 +2551,8 @@ playback_pause(void *arg, int *retval)
 static enum command_state
 playback_flush(void *arg, int *retval)
 {
+  stats_player_add(STATS_PLAYER_FLUSHES, 1);
+
   if (player_state == PLAY_STOPPED)
     {
       *retval = -1;

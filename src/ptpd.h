@@ -15,6 +15,11 @@ struct airptp_clock_info;
 int
 ptpd_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id);
 
+struct airptp_peer_info;
+
+int
+ptpd_peers_get(struct airptp_peer_info *info, int max);
+
 void
 ptpd_slave_remove(uint32_t slave_id);
 

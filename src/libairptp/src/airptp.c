@@ -366,6 +366,31 @@ airptp_clocks_get(struct airptp_clock_info *info, int max, struct airptp_handle 
   return n;
 }
 
+int
+airptp_peers_get(struct airptp_peer_info *info, int max, struct airptp_handle *hdl)
+{
+  struct airptp_peer *peer;
+  int n = 0;
+  int i;
+
+  if (!hdl || !hdl->is_daemon || hdl->state != AIRPTP_STATE_RUNNING)
+    return 0;
+
+  pthread_mutex_lock(&hdl->daemon.clock_sources_lck);
+  for (i = 0; i < hdl->daemon.num_peers && n < max; i++)
+    {
+      peer = &hdl->daemon.peers[i];
+      memset(&info[n], 0, sizeof(info[n]));
+      utils_net_address_get(info[n].address, sizeof(info[n].address), &peer->naddr);
+      info[n].is_active = peer->is_active;
+      info[n].last_seen = peer->last_seen;
+      n++;
+    }
+  pthread_mutex_unlock(&hdl->daemon.clock_sources_lck);
+
+  return n;
+}
+
 const char *
 airptp_errmsg_get(void)
 {

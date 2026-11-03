@@ -58,6 +58,8 @@
 #include "airplay_events.h"
 #include "pair_ap/pair.h"
 #include "airplay_receiver.h"
+#include "dsp.h"
+#include "stats.h"
 
 /* List of TODO's for AirPlay 2
  *
@@ -256,6 +258,13 @@ struct airplay_master_session
   // the position that we send in the sync packages are offset by this amount
   // compared to the rtptimes of the corresponding RTP packages we are sending)
   uint32_t output_buffer_samples;
+
+  // Speaker EQ/crossover/channel routing. Devices with different profiles get
+  // their own master session (and stream), all timed from the same player pts
+  struct dsp_profile eq;
+  struct dsp_ctx *dsp;
+  uint8_t *dspbuf;
+  size_t dspbuf_size;
 
   struct airplay_master_session *next;
 };
@@ -1135,6 +1144,8 @@ master_session_free(struct airplay_master_session *ams)
   if (ams->encoded_buffer)
     evbuffer_free(ams->encoded_buffer);
 
+  dsp_free(ams->dsp);
+  free(ams->dspbuf);
   free(ams->rawbuf);
   free(ams);
 }
@@ -1168,8 +1179,20 @@ master_session_cleanup(struct airplay_master_session *ams)
   master_session_free(ams);
 }
 
+static int
+master_sessions_count(void)
+{
+  struct airplay_master_session *ams;
+  int n = 0;
+
+  for (ams = airplay_master_sessions; ams; ams = ams->next)
+    n++;
+
+  return n;
+}
+
 static struct airplay_master_session *
-master_session_make(struct media_quality *quality, bool use_ptp, bool buffered)
+master_session_make(struct media_quality *quality, bool use_ptp, bool buffered, const struct dsp_profile *eq)
 {
   struct airplay_master_session *ams;
   uint64_t buffer_duration_ms;
@@ -1180,7 +1203,8 @@ master_session_make(struct media_quality *quality, bool use_ptp, bool buffered)
   // First check if we already have a suitable session
   for (ams = airplay_master_sessions; ams; ams = ams->next)
     {
-      if (quality_is_equal(quality, &ams->rtp_session->quality) && use_ptp == ams->use_ptp && buffered == ams->buffered)
+      if (quality_is_equal(quality, &ams->rtp_session->quality) && use_ptp == ams->use_ptp && buffered == ams->buffered &&
+	  dsp_profile_equal(eq, &ams->eq))
 	return ams;
     }
 
@@ -1228,6 +1252,15 @@ master_session_make(struct media_quality *quality, bool use_ptp, bool buffered)
   ams->quality = *quality;
   ams->use_ptp = use_ptp;
   ams->buffered = buffered;
+
+  ams->eq = *eq;
+  if (!dsp_profile_is_neutral(eq))
+    {
+      if (quality->bits_per_sample != 16)
+	DPRINTF(E_LOG, L_AIRPLAY, "EQ needs 16 bit audio, this session is %d bit, EQ not applied\n", quality->bits_per_sample);
+      else
+	ams->dsp = dsp_new(eq, quality->sample_rate);
+    }
 
   if (buffered)
     {
@@ -1334,6 +1367,9 @@ session_failure(struct airplay_session *session)
   /* Session failed, let our user know */
   if (session->state != AIRPLAY_STATE_AUTH)
     session->state = AIRPLAY_STATE_FAILED;
+
+  stats_output_add(session->device_id, STATS_OUTPUT_FAILURES, 1);
+  stats_output_event(session->device_id, session->state == AIRPLAY_STATE_AUTH ? "needs authorisation" : "session failed");
 
   session_status(session);
 
@@ -1631,6 +1667,7 @@ session_make(struct output_device *device, int callback_id)
 {
   struct airplay_session *session;
   struct airplay_extra *extra;
+  struct dsp_profile eq;
   int ret;
 
   extra = device->extra_device_info;
@@ -1677,12 +1714,21 @@ session_make(struct output_device *device, int callback_id)
       session->buffered = false;
     }
 
-  session->master_session = master_session_make(&device->quality, extra->use_ptp, session->buffered);
+  dsp_profile_get(&eq, device->id);
+
+  session->master_session = master_session_make(&device->quality, extra->use_ptp, session->buffered, &eq);
   if (!session->master_session)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Could not attach a master session for device '%s'\n", device->name);
       goto error;
     }
+
+  if (session->master_session->dsp)
+    DPRINTF(E_INFO, L_AIRPLAY, "Applying EQ profile to device '%s'\n", device->name);
+
+  stats_output_add(device->id, STATS_OUTPUT_SESSIONS, 1);
+  stats_output_event(device->id, session->buffered ? "session started (buffered AAC)" : "session started (realtime ALAC)");
+  stats_output_session_set(device->id, session->buffered ? "buffered AAC/TCP" : "realtime ALAC/UDP", session->master_session->dsp != NULL, master_sessions_count());
 
   // Attach to list of sessions
   session->next = airplay_sessions;
@@ -2081,6 +2127,8 @@ packet_send(struct airplay_session *session, struct rtp_packet *pkt)
   if (sent < 0)
     {
       DPRINTF(E_LOG, L_AIRPLAY, "Send error for '%s': %s\n", session->devname, strerror(errno));
+      stats_output_add(session->device_id, STATS_OUTPUT_SEND_ERRORS, 1);
+      stats_output_event(session->device_id, "send error");
 
       // Can't free it right away, it would make the ->next in the calling
       // master_session and session loops invalid
@@ -2090,8 +2138,12 @@ packet_send(struct airplay_session *session, struct rtp_packet *pkt)
   else if (sent != buf_len)
     {
       DPRINTF(E_WARN, L_AIRPLAY, "Partial send (%zd) for '%s'\n", sent, session->devname);
+      stats_output_add(session->device_id, STATS_OUTPUT_SEND_ERRORS, 1);
       return -1;
     }
+
+  stats_output_add(session->device_id, STATS_OUTPUT_PACKETS, 1);
+  stats_output_add(session->device_id, STATS_OUTPUT_BYTES, sent);
 
 /*
   DPRINTF(E_DBG, L_AIRPLAY, "RTP PACKET seqnum %u, rtptime %u, payload 0x%x, pktbuf_s %zu\n",
@@ -2163,14 +2215,22 @@ packets_resend(struct airplay_session *session, uint16_t seqnum, int len)
   // 0x000060: 85 ff 11 4f f2 b5 de f7 cf 0f 7e 4b 55 e5 7b 25 ...O......~KU.{%
   // 0x000070: 13 9a 5f c3 4e f4 9d d1 f5 cb...
 
+  stats_output_add(session->device_id, STATS_OUTPUT_RETRANSMIT_REQUESTS, 1);
+
   // Note that seqnum may wrap around, so we don't use it for counting
   for (i = 0, s = seqnum; i < len; i++, s++)
     {
       pkt = rtp_packet_get(rtp_session, s);
       if (pkt)
-	packet_send(session, pkt);
+	{
+	  packet_send(session, pkt);
+	  stats_output_add(session->device_id, STATS_OUTPUT_RETRANSMITS, 1);
+	}
       else
-	pkt_missing = true;
+	{
+	  pkt_missing = true;
+	  stats_output_add(session->device_id, STATS_OUTPUT_RETRANSMITS_MISSED, 1);
+	}
     }
 
   if (pkt_missing)
@@ -4521,12 +4581,81 @@ airplay_device_authorize(struct output_device *device, const char *pin, int call
   return 1;
 }
 
+// EQ profiles were changed (API). A master session whose devices now all
+// want the same new profile is updated in place, so the change is heard right
+// away without restarting the stream. If its devices disagree the change is
+// applied when the device's session is next set up.
 static void
-airplay_write(struct output_buffer *obuf)
+master_sessions_dsp_refresh(void)
 {
   struct airplay_master_session *ams;
   struct airplay_session *session;
+  struct dsp_profile want;
+  struct dsp_profile p;
+  bool have_want;
+  bool agree;
+
+  for (ams = airplay_master_sessions; ams; ams = ams->next)
+    {
+      have_want = false;
+      agree = true;
+      for (session = airplay_sessions; session; session = session->next)
+	{
+	  if (session->master_session != ams)
+	    continue;
+
+	  dsp_profile_get(&p, session->device_id);
+	  if (!have_want)
+	    {
+	      want = p;
+	      have_want = true;
+	    }
+	  else if (!dsp_profile_equal(&p, &want))
+	    agree = false;
+	}
+
+      if (!have_want || dsp_profile_equal(&want, &ams->eq))
+	continue;
+
+      if (!agree)
+	{
+	  DPRINTF(E_LOG, L_AIRPLAY, "EQ change for a speaker that shares its stream with others, it applies when the speaker reconnects\n");
+	  continue;
+	}
+
+      ams->eq = want;
+      if (dsp_profile_is_neutral(&want))
+	{
+	  dsp_free(ams->dsp);
+	  ams->dsp = NULL;
+	}
+      else if (ams->dsp)
+	dsp_update(ams->dsp, &want);
+      else if (ams->quality.bits_per_sample == 16)
+	ams->dsp = dsp_new(&want, ams->quality.sample_rate);
+
+      for (session = airplay_sessions; session; session = session->next)
+	if (session->master_session == ams)
+	  stats_output_session_set(session->device_id, session->buffered ? "buffered AAC/TCP" : "realtime ALAC/UDP", ams->dsp != NULL, master_sessions_count());
+
+      DPRINTF(E_INFO, L_AIRPLAY, "EQ profile updated on a running stream\n");
+    }
+}
+
+static void
+airplay_write(struct output_buffer *obuf)
+{
+  static uint32_t dsp_generation;
+  struct airplay_master_session *ams;
+  struct airplay_session *session;
+  uint64_t clips;
   int i;
+
+  if (dsp_generation != dsp_generation_get())
+    {
+      dsp_generation = dsp_generation_get();
+      master_sessions_dsp_refresh();
+    }
 
   for (ams = airplay_master_sessions; ams; ams = ams->next)
     {
@@ -4542,8 +4671,28 @@ airplay_write(struct output_buffer *obuf)
 	  // Sends sync packets to new sessions, and if it is sync time then also to old sessions
 	  packets_sync_send(ams);
 
-	  // TODO avoid this copy
-	  evbuffer_add(ams->input_buffer, obuf->data[i].buffer, obuf->data[i].bufsize);
+	  if (ams->dsp)
+	    {
+	      // The player's buffer is shared by all master sessions, so process
+	      // a copy
+	      if (ams->dspbuf_size < obuf->data[i].bufsize)
+		{
+		  free(ams->dspbuf);
+		  CHECK_NULL(L_AIRPLAY, ams->dspbuf = malloc(obuf->data[i].bufsize));
+		  ams->dspbuf_size = obuf->data[i].bufsize;
+		}
+	      memcpy(ams->dspbuf, obuf->data[i].buffer, obuf->data[i].bufsize);
+	      dsp_process_s16(ams->dsp, (int16_t *)ams->dspbuf, obuf->data[i].samples, ams->quality.channels);
+	      evbuffer_add(ams->input_buffer, ams->dspbuf, obuf->data[i].bufsize);
+
+	      clips = dsp_clips_take(ams->dsp);
+	      if (clips)
+		for (session = airplay_sessions; session; session = session->next)
+		  if (session->master_session == ams)
+		    stats_output_add(session->device_id, STATS_OUTPUT_DSP_CLIPS, clips);
+	    }
+	  else
+	    evbuffer_add(ams->input_buffer, obuf->data[i].buffer, obuf->data[i].bufsize);
 	  ams->input_buffer_samples += obuf->data[i].samples;
 
 	  // Send as many packets as we have data for (one packet requires rawbuf_size bytes)

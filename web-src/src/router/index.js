@@ -44,6 +44,7 @@ import PageSettingsArtwork from '@/pages/PageSettingsArtwork.vue'
 import PageSettingsDevices from '@/pages/PageSettingsDevices.vue'
 import PageSettingsOnlineServices from '@/pages/PageSettingsOnlineServices.vue'
 import PageSettingsWebinterface from '@/pages/PageSettingsWebinterface.vue'
+import settingsRoutes from '@/router/settings'
 
 const TOP_WITH_TABS = 100
 
@@ -266,7 +267,8 @@ export const router = createRouter({
       component: PageSettingsDevices,
       name: 'settings-devices',
       path: '/settings/devices'
-    }
+    },
+    ...settingsRoutes
   ],
   scrollBehavior(to, from, savedPosition) {
     const delay = 0

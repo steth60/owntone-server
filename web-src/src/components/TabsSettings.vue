@@ -12,6 +12,11 @@ const links = computed(() => [
     to: { name: 'settings-webinterface' }
   },
   { key: 'page.settings.tabs.devices', to: { name: 'settings-devices' } },
+  { key: 'page.settings.tabs.eq', to: { name: 'settings-eq' } },
+  {
+    key: 'page.settings.tabs.performance',
+    to: { name: 'settings-performance' }
+  },
   { key: 'page.settings.tabs.artwork', to: { name: 'settings-artwork' } },
   {
     key: 'page.settings.tabs.online-services',

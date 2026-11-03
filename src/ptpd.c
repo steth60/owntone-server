@@ -79,6 +79,15 @@ ptpd_slave_remove(uint32_t slave_id)
 }
 
 int
+ptpd_peers_get(struct airptp_peer_info *info, int max)
+{
+  if (!ptpd_hdl)
+    return 0;
+
+  return airptp_peers_get(info, max, ptpd_hdl);
+}
+
+int
 ptpd_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id)
 {
   if (!ptpd_hdl)

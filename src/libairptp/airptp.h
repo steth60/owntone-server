@@ -2,6 +2,8 @@
 #define __AIRPTP_H__
 
 #include <inttypes.h>
+#include <stdbool.h>
+#include <stddef.h>
 
 /* libairptp supports three modes of operation:
  * - Running a shared, standalone ptp daemon. In this case you will bind the ptp
@@ -96,6 +98,18 @@ airptp_clock_info_get(struct airptp_clock_info *info, uint64_t clock_id, struct 
 // Fills up to max entries with all tracked clocks, returns the number filled
 int
 airptp_clocks_get(struct airptp_clock_info *info, int max, struct airptp_handle *hdl);
+
+// The devices we serve our clock to (e.g. AirPlay speakers), and when we last
+// heard from each of them
+struct airptp_peer_info
+{
+  char address[64];
+  bool is_active;
+  int64_t last_seen;     // Unix time, seconds
+};
+
+int
+airptp_peers_get(struct airptp_peer_info *info, int max, struct airptp_handle *hdl);
 
 // By default airptp uses ports 319 and 320 as set by the standard, but for
 // testing you can override that here.

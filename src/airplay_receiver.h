@@ -19,6 +19,13 @@ airplay_receiver_init(void);
 void
 airplay_receiver_deinit(void);
 
+struct json_object;
+
+// Adds a "receiver" object with the stream and sender clock state (for the
+// monitoring page). Thread: any
+void
+airplay_receiver_stats_json_add(struct json_object *obj);
+
 // True if name is the name the receiver advertises, so the AirPlay output
 // module can avoid adding OwnTone's own receiver as a speaker.
 bool
