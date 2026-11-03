@@ -854,16 +854,26 @@ pipe_metadata_read_cb(evutil_socket_t fd, short event, void *arg)
   ret = evbuffer_read(pipe_metadata.evbuf, pipe_metadata.pipe->fd, PIPE_READ_MAX);
   if (ret < 0)
     {
-      if (errno != EAGAIN)
-	pipe_metadata_watch_del(NULL);
+      // The event is not persistent, so even a spurious wakeup (EAGAIN) must
+      // re-add it, otherwise we silently stop reading metadata while keeping
+      // the pipe open - the writer (Shairport) then blocks once the pipe buffer
+      // is full. This happens e.g. when the writer restarts.
+      if (errno == EAGAIN || errno == EINTR)
+	goto readd;
+
+      DPRINTF(E_LOG, L_PLAYER, "Error reading metadata pipe '%s', will stop reading: %s\n", pipe_metadata.pipe->path, strerror(errno));
+      pipe_metadata_watch_del(NULL);
       return;
     }
   else if (ret == 0)
     {
-      // Reset the pipe
+      // Writer closed the pipe (e.g. Shairport restarted), reopen
       ret = watch_reset(pipe_metadata.pipe);
       if (ret < 0)
-	return;
+	{
+	  DPRINTF(E_LOG, L_PLAYER, "Could not reopen metadata pipe '%s', will stop reading\n", pipe_metadata.pipe->path);
+	  return;
+	}
       goto readd;
     }
 
