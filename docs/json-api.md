@@ -12,6 +12,7 @@ Available API endpoints:
 * [Queue](#queue): list, add or modify the current queue
 * [Library](#library): list playlists, artists, albums and tracks from your library or trigger library rescan
 * [Search](#search): search for playlists, artists, albums and tracks
+* [Statistics](#statistics): performance and sync figures
 * [Server info](#server-info): get server information
 * [Settings](#settings): list and change settings for the player web interface
 * [Push notifications](#push-notifications): receive push notifications
@@ -314,6 +315,8 @@ curl -X PUT "http://localhost:3689/api/player/seek?seek_ms=-30000"
 | GET       | [/api/outputs/{id}](#get-an-output)              | Get an output                        |
 | PUT       | [/api/outputs/{id}](#change-an-output)           | Change an output setting             |
 | PUT       | [/api/outputs/{id}/toggle](#toggle-an-output)    | Enable or disable an output, depending on the current state |
+| GET       | [/api/outputs/{id}/eq](#get-an-outputs-eq)        | Get the EQ profile of an output      |
+| PUT       | [/api/outputs/{id}/eq](#set-an-outputs-eq)        | Set the EQ profile of an output      |
 
 ### Get a list of available outputs
 
@@ -526,6 +529,100 @@ On success returns the HTTP `204 No Content` success status response code.
 
 ```shell
 curl -X PUT "http://localhost:3689/api/outputs/0/toggle"
+```
+
+### Get an output's EQ
+
+Get the EQ, crossover and channel routing profile of an AirPlay 2 output. See
+[AirPlay 2 sender (TX)](airplay2/sender.md#speaker-eq-and-crossover).
+
+**Endpoint**
+
+```http
+GET /api/outputs/{id}/eq
+```
+
+**Path parameters**
+
+| Parameter       | Value                |
+| --------------- | -------------------- |
+| id              | Output id            |
+
+**Response**
+
+| Key             | Type     | Value                                                    |
+| --------------- | -------- | -------------------------------------------------------- |
+| enabled         | boolean  | `true` if the profile is applied                         |
+| preamp_db       | float    | Preamp gain, -24 to +12 dB                               |
+| bands           | array    | Five objects with `freq`, `type` and `gain_db` (-12 to +12 dB) |
+| highpass_hz     | integer  | High pass corner, 0 for off                              |
+| lowpass_hz      | integer  | Low pass corner, 0 for off                               |
+| channels        | string   | `stereo`, `left`, `right`, `mono` or `swap`              |
+
+**Example**
+
+```shell
+curl -X GET "http://localhost:3689/api/outputs/0/eq"
+```
+
+### Set an output's EQ
+
+Replace the EQ profile of an output. The change is heard right away if the
+speaker doesn't share its stream with speakers that have another profile.
+
+**Endpoint**
+
+```http
+PUT /api/outputs/{id}/eq
+```
+
+**Path parameters**
+
+| Parameter       | Value                |
+| --------------- | -------------------- |
+| id              | Output id            |
+
+**Request**
+
+The body is a profile in the format of [Get an output's EQ](#get-an-outputs-eq).
+Missing keys take their defaults, and `enabled` defaults to `false`. `bands`
+may also be a plain array of five gains.
+
+**Response**
+
+On success returns the HTTP `204 No Content` success status response code. A
+high pass at or above the low pass gives `400 Bad Request`.
+
+**Example**
+
+```shell
+curl -X PUT "http://localhost:3689/api/outputs/0/eq" \
+  -d '{"enabled": true, "highpass_hz": 120, "channels": "left"}'
+```
+
+## Statistics
+
+| Method    | Endpoint                                         | Description                          |
+| --------- | ------------------------------------------------ | ------------------------------------ |
+| GET       | [/api/stats](#get-statistics)                    | Get performance and sync figures     |
+
+### Get statistics
+
+Get counters for the player and each output, process and host figures, the
+PTP state and the AirPlay receiver. Counters only increase, so rates come from
+the difference between two calls. The fields are described in
+[AirPlay 2 sender (TX)](airplay2/sender.md#monitoring).
+
+**Endpoint**
+
+```http
+GET /api/stats
+```
+
+**Example**
+
+```shell
+curl -X GET "http://localhost:3689/api/stats"
 ```
 
 ## Queue

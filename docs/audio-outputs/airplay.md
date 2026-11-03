@@ -32,3 +32,15 @@ set the speaker's format to `aac` (the default is `alac`). The option is only
 offered for devices that advertise support for buffered audio and PTP. Note
 that the buffered stream is AAC, which is lossy, whereas the realtime stream is
 lossless. The change takes effect the next time the speaker is started.
+
+## Speaker EQ and crossover
+
+Each AirPlay speaker can have its own EQ, crossover and channel routing, set
+under Settings > Speaker EQ. This lets a HomePod pair play only the bass while
+two minis play left and right above it. See
+[AirPlay 2 sender (TX)](../airplay2/sender.md#speaker-eq-and-crossover).
+
+## OwnTone as an AirPlay speaker
+
+OwnTone can also receive AirPlay 2 from Music.app or an iPhone and play it on
+its own speakers. See [AirPlay 2 receiver (RX)](../airplay2/receiver.md).

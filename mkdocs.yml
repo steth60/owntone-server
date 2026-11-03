@@ -158,6 +158,9 @@ nav:
       - Web: audio-outputs/web.md
       - Roku: audio-outputs/roku.md
       - Streaming: audio-outputs/streaming.md
+    - AirPlay 2:
+      - Receiver (RX): airplay2/receiver.md
+      - Sender (TX): airplay2/sender.md
     - Media Clients: media-clients.md
     - Artwork: artwork.md
     - Playlists and Radio: playlists.md
