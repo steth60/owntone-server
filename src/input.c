@@ -42,6 +42,12 @@
 // Disallow further writes to the buffer when its size exceeds this threshold.
 // The below gives us room to buffer 2 seconds of 48000/16/2 audio.
 #define INPUT_BUFFER_THRESHOLD STOB(96000, 16, 2)
+// A live source, e.g. a pipe fed in real time by an AirPlay receiver, fills the
+// buffer only as fast as it plays. After a flush or an underrun the player
+// waits for a full buffer before it resumes, which for a live source would
+// leave it permanently INPUT_BUFFER_THRESHOLD (~2 s) behind real time. Live
+// sources therefore resume as soon as this much audio is buffered.
+#define INPUT_LIVE_RESUME_MS 100
 // How long (in nsec) to wait when the input buffer is full before looping
 #define INPUT_LOOP_TIMEOUT_NSEC 10000000
 // How long (in sec) to keep an input open without the player reading from it
@@ -368,6 +374,24 @@ buffer_full_cb(void)
   input_buffer.full_cb = NULL;
 }
 
+// Caller must hold input_buffer.mutex
+static inline bool
+live_resume_ready(void)
+{
+  struct media_quality *q = &input_buffer.cur_write_quality;
+  size_t bytes;
+
+  if (!input_buffer.full_cb || input_now_reading.type != INPUT_TYPE_PIPE)
+    return false;
+
+  if (q->sample_rate > 0 && q->bits_per_sample > 0 && q->channels > 0)
+    bytes = STOB(q->sample_rate * INPUT_LIVE_RESUME_MS / 1000, q->bits_per_sample, q->channels);
+  else
+    bytes = STOB(44100 * INPUT_LIVE_RESUME_MS / 1000, 16, 2);
+
+  return evbuffer_get_length(input_buffer.evbuf) >= bytes;
+}
+
 
 /* ------------------------- INPUT SOURCE HANDLING -------------------------- */
 
@@ -666,6 +690,12 @@ input_write(struct evbuffer *evbuf, struct media_quality *quality, short flags)
 
   if (flags)
     markers_set(flags, len);
+
+  if (live_resume_ready())
+    {
+      DPRINTF(E_DBG, L_PLAYER, "Live input has %d ms buffered, resuming playback\n", INPUT_LIVE_RESUME_MS);
+      buffer_full_cb();
+    }
 
   pthread_mutex_unlock(&input_buffer.mutex);
 

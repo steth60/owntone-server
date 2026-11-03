@@ -54,9 +54,10 @@ AirPlay 1 output modules skip a speaker whose name matches `name`.
   to 0, which maps linearly to 0 to 100, and -144 means mute. This is the same
   mapping the pipe input uses for Shairport Sync's `pvol`.
 - **Audio is timed to the sender's clock.** OwnTone plays each frame at the
-  time the sender asked for, so it stays in step with the other speakers the
-  sender is grouping. If that time has already passed, OwnTone starts as soon
-  as it can and logs how late it was.
+  time the sender asked for, so it stays in step with the sender's video and
+  with the other speakers the sender is grouping. If the start of the audio is
+  already due when it arrives, OwnTone skips that part and joins the sender's
+  timeline, rather than playing late for the rest of the stream.
 
 ## Monitoring
 
@@ -72,6 +73,7 @@ sees it. The same figures are in the `receiver` object of `GET /api/stats`:
 | `packets_undecryptable` | Packets that failed decryption. Should stay at 0               |
 | `packets_dropped`       | Packets dropped by flushes, skips or the queue limit           |
 | `queued_bytes`          | Decrypted audio waiting for the player                          |
+| `late_ms_skipped`       | Audio skipped because it was due before the outputs could play it |
 | `anchor_age_ms`         | Time since the anchor frame played                             |
 | `sender_clock`          | Offset, jitter, drift, samples and steps of the followed clock |
 
@@ -223,8 +225,11 @@ audible_ns  = anchor_ns + (rtptime - anchor_rtptime) * 1e9 / sample_rate
 pts_ns      = audible_ns - output_buffer_ms * 1e6
 ```
 
-Frames due before the anchor are dropped. The input waits until `pts_ns` is
-within 10 ms. Its first write carries `INPUT_FLAG_SYNC`, and `ts_get()` returns
+Frames due before the anchor are dropped. If `pts_ns` of the first frame has
+already passed, whole frames are dropped until it is less than half a frame
+late. Music.app anchors at "now", so with a 500 ms output buffer this skips
+about the first 330 ms. Otherwise the input waits until `pts_ns` is within
+10 ms. Its first write carries `INPUT_FLAG_SYNC`, and `ts_get()` returns
 `pts_ns`, so the player stamps that write with `pts_ns` instead of "now".
 OwnTone's player clock is also `CLOCK_MONOTONIC`, so no further conversion is
 needed. If the sender's clock is not being followed, the anchor is set to now
@@ -284,7 +289,14 @@ was captured from a Shairport Sync receiver fed by OwnTone.
 ## Shairport Sync and the pipe instead
 
 Until the receiver plays everything, Shairport Sync writing into an OwnTone
-pipe remains a good option. Two fixes in this fork help that setup:
+pipe remains a good option. Three fixes in this fork help that setup:
+
+- **A pipe resumes without a backlog.** After a flush or an underrun the player
+  waits for a full input buffer, about 2.2 s, before it resumes. A live pipe
+  fills only in real time, so the audio stayed 2.2 s behind the sender and
+  video lost lip sync. Music sends a flush on every play, skip and seek. A pipe
+  now resumes once 100 ms is buffered. In the lab the delay after a flush went
+  from 2.2 s to about 0.1 s.
 
 - **Metadata keeps flowing after a spurious wakeup.** The pipe input used to
   stop reading the metadata pipe after an `EAGAIN`, so volume changes were lost

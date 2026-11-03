@@ -243,6 +243,9 @@ struct rx_stream
   uint64_t packets_in;
   uint64_t packets_bad;
   uint64_t packets_dropped;
+  // Frames skipped because they were due before the outputs could play them
+  uint64_t late_frames_dropped; // While syncing to the current anchor
+  uint64_t late_ms_total;
 };
 
 static struct rx_stream rx_stream = { .lck = PTHREAD_MUTEX_INITIALIZER };
@@ -2243,6 +2246,7 @@ airplay_receiver_stats_json_add(struct json_object *obj)
   json_object_object_add(rx, "packets_undecryptable", json_object_new_int64(rx_stream.packets_bad));
   json_object_object_add(rx, "packets_dropped", json_object_new_int64(rx_stream.packets_dropped));
   json_object_object_add(rx, "queued_bytes", json_object_new_int64(rx_stream.queued_bytes));
+  json_object_object_add(rx, "late_ms_skipped", json_object_new_int64(rx_stream.late_ms_total));
   anchored = rx_stream.anchor_valid;
   if (anchored)
     anchor_in_ms = ((int64_t)rx_stream.anchor_local_ns - (int64_t)now_ns()) / 1000000;
@@ -2606,6 +2610,8 @@ rxin_play(struct input_source *source)
   struct rx_packet *last;
   short flags = ctx->pending_flags;
   int64_t frame_offset;
+  int64_t frame_ns;
+  uint64_t late_frames;
   int64_t audible_ns;
   int64_t pts_ns;
   int64_t now;
@@ -2626,6 +2632,7 @@ rxin_play(struct input_source *source)
     {
       ctx->generation = rx_stream.generation;
       ctx->synced = false;
+      rx_stream.late_frames_dropped = 0;
     }
 
   // Paused or waiting for the sender's anchor
@@ -2644,22 +2651,45 @@ rxin_play(struct input_source *source)
 	goto wait;
 
       // When the first frame must be audible, and so when it must leave the
-      // player, given the outputs' buffer
-      frame_offset = (int32_t)(rx_stream.head->rtptime - rx_stream.anchor_rtptime);
-      audible_ns = (int64_t)rx_stream.anchor_local_ns + frame_offset * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
-      pts_ns = audible_ns - (int64_t)outputs_buffer_duration_ms_get() * 1000000LL;
+      // player, given the outputs' buffer. If that has already passed, drop
+      // whole frames until we are back on the sender's timeline, so the audio
+      // stays in step with the sender's video and its other speakers, instead
+      // of playing late for the rest of the stream.
       now = (int64_t)now_ns();
+      for (late_frames = 0; ; late_frames++)
+	{
+	  frame_offset = (int32_t)(rx_stream.head->rtptime - rx_stream.anchor_rtptime);
+	  audible_ns = (int64_t)rx_stream.anchor_local_ns + frame_offset * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
+	  pts_ns = audible_ns - (int64_t)outputs_buffer_duration_ms_get() * 1000000LL;
+	  frame_ns = RX_AAC_FRAME_SAMPLES * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
+
+	  if (pts_ns + frame_ns / 2 >= now)
+	    break;
+
+	  stream_drop_head_locked();
+	  rx_stream.packets_dropped++;
+	  if (!rx_stream.head)
+	    {
+	      rx_stream.late_frames_dropped += late_frames + 1;
+	      goto wait;
+	    }
+	}
+      rx_stream.late_frames_dropped += late_frames;
 
       if (pts_ns > now + RX_INPUT_START_MARGIN_NS)
 	goto wait;
 
-      if (pts_ns < now)
-	{
-	  DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream %" PRIi64 " ms later than the sender asked for\n", (now - pts_ns) / 1000000);
-	  pts_ns = now;
-	}
+      if (rx_stream.late_frames_dropped)
+	DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream on the sender's timeline, skipped %" PRIu64 " ms that was due before the outputs could play it\n",
+		rx_stream.late_frames_dropped * RX_AAC_FRAME_SAMPLES * 1000 / ssrc_sample_rate(rx_stream.head->ssrc));
       else
 	DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream at the sender's anchor (seq %u, rtptime %u)\n", rx_stream.head->seq, rx_stream.head->rtptime);
+      rx_stream.late_ms_total += rx_stream.late_frames_dropped * RX_AAC_FRAME_SAMPLES * 1000 / ssrc_sample_rate(rx_stream.head->ssrc);
+      rx_stream.late_frames_dropped = 0;
+
+      // Less than half a frame late at most, the player can't start in the past
+      if (pts_ns < now)
+	pts_ns = now;
 
       ctx->sync_ts.tv_sec = pts_ns / 1000000000LL;
       ctx->sync_ts.tv_nsec = pts_ns % 1000000000LL;
