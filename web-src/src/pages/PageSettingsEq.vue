@@ -21,10 +21,17 @@ import ContentWithHeading from '@/templates/ContentWithHeading.vue'
 import ControlSpeakerEq from '@/components/ControlSpeakerEq.vue'
 import PaneTitle from '@/components/PaneTitle.vue'
 import TabsSettings from '@/components/TabsSettings.vue'
-import { computed } from 'vue'
+import { computed, onMounted } from 'vue'
 import { useOutputsStore } from '@/stores/outputs'
 
 const outputsStore = useOutputsStore()
+
+// The list normally arrives via the websocket, load it if that hasn't happened
+onMounted(() => {
+  if (!outputsStore.outputs.length) {
+    outputsStore.initialise()
+  }
+})
 
 // EQ is applied in the AirPlay output
 const speakers = computed(() =>
