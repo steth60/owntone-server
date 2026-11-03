@@ -17,11 +17,11 @@
 </template>
 
 <script setup>
+import { computed, onMounted } from 'vue'
 import ContentWithHeading from '@/templates/ContentWithHeading.vue'
 import ControlSpeakerEq from '@/components/ControlSpeakerEq.vue'
 import PaneTitle from '@/components/PaneTitle.vue'
 import TabsSettings from '@/components/TabsSettings.vue'
-import { computed, onMounted } from 'vue'
 import { useOutputsStore } from '@/stores/outputs'
 
 const outputsStore = useOutputsStore()
