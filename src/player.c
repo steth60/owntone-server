@@ -266,6 +266,10 @@ struct player_session
   // Equals current number of samples written to outputs
   uint32_t pos;
 
+  // Samples to drop because the input's sync timestamp had already passed
+  // when we got to it, see session_update_read_ts()
+  uint64_t skip_samples;
+
   // The player sources also have a quality property, but in some situations
   // they may get cleared. So we also save it here.
   struct media_quality quality;
@@ -927,10 +931,31 @@ session_update_read_quality(struct media_quality *quality)
   free(quality);
 }
 
+// The input wants its audio to leave for the outputs at ts (it plays on a
+// sender's timeline). If ts has already passed, typically because the
+// speakers took a few seconds to start, everything would reach them late and
+// stay late. Some speakers (HomePods) then drop it all. So the audio that is
+// overdue is skipped and playback carries on at the sender's position.
 static void
 session_update_read_ts(struct timespec *ts)
 {
+  struct timespec now;
+  int64_t late_ns;
+  int rate;
+
   pb_session.pts = *ts;
+
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  late_ns = (int64_t)(now.tv_sec - ts->tv_sec) * 1000000000LL + (now.tv_nsec - ts->tv_nsec);
+  rate = pb_session.quality.sample_rate ? pb_session.quality.sample_rate : 44100;
+
+  if (late_ns > 10000000LL)
+    {
+      pb_session.skip_samples = (uint64_t)late_ns * rate / 1000000000ULL;
+      DPRINTF(E_LOG, L_PLAYER, "Input timestamp is %" PRIi64 " ms in the past, skipping that much audio to stay on its timeline\n", late_ns / 1000000);
+    }
+  else
+    pb_session.skip_samples = 0;
 
   free(ts);
 }
@@ -962,6 +987,7 @@ session_restart(void)
   pb_session.pts.tv_sec = 0;
   pb_session.pts.tv_nsec = 0;
   pb_session.read_deficit = 0;
+  pb_session.skip_samples = 0;
   pb_session.metadata_sent = 0;
 }
 
@@ -1348,6 +1374,18 @@ playback_cb(int fd, short what, void *arg)
       if (nbytes == 0)
 	{
 	  break;
+	}
+
+      // Overdue audio, see session_update_read_ts(). Skipping doesn't count as
+      // this tick's read, so all of it goes in one tick if the input has it.
+      if (pb_session.skip_samples > 0 && pb_session.quality.sample_rate)
+	{
+	  pb_session.skip_samples -= ((uint64_t)nsamples < pb_session.skip_samples) ? (uint64_t)nsamples : pb_session.skip_samples;
+	  ts.tv_sec = 0;
+	  ts.tv_nsec = 1000000000UL * (uint64_t)nsamples / pb_session.quality.sample_rate;
+	  pb_session.pts = timespec_add(pb_session.pts, ts);
+	  i++;
+	  continue;
 	}
 
       pb_session.read_deficit -= nbytes;

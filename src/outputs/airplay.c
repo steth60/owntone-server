@@ -2653,6 +2653,7 @@ payload_make_setrateanchortime(struct evrtsp_request *req, struct airplay_sessio
 {
   struct airplay_master_session *ams = session->master_session;
   struct rtcp_timestamp cur_stamp = ams->cur_stamp;
+  struct timespec now;
   plist_t root;
   uint8_t *data;
   size_t len;
@@ -2685,8 +2686,10 @@ payload_make_setrateanchortime(struct evrtsp_request *req, struct airplay_sessio
   if (ret < 0)
     return -1;
 
-  DPRINTF(E_DBG, L_AIRPLAY, "Anchor for '%s': rtptime=%u (pos=%u, offset=%d), networktime=%ld.%09ld, clock_id=%" PRIx64 "\n",
-    session->devname, rtptime, cur_stamp.pos, session->offset_samples, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec, ams->rtp_session->ptp_clock_id);
+  clock_gettime(CLOCK_MONOTONIC, &now);
+  DPRINTF(E_INFO, L_AIRPLAY, "Anchor for '%s': rtptime=%u (pos=%u, offset=%d), networktime=%ld.%09ld (%+" PRIi64 " ms from now), clock_id=%" PRIx64 "\n",
+    session->devname, rtptime, cur_stamp.pos, session->offset_samples, (long)cur_stamp.ts.tv_sec, (long)cur_stamp.ts.tv_nsec,
+    (int64_t)((cur_stamp.ts.tv_sec - now.tv_sec) * 1000 + (cur_stamp.ts.tv_nsec - now.tv_nsec) / 1000000), ams->rtp_session->ptp_clock_id);
 
   evbuffer_add(req->output_buffer, data, len);
   free(data);
