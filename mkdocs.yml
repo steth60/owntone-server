@@ -161,6 +161,7 @@ nav:
     - AirPlay 2:
       - Receiver (RX): airplay2/receiver.md
       - Sender (TX): airplay2/sender.md
+      - Virtual speakers (design): airplay2/virtual-speakers.md
     - Media Clients: media-clients.md
     - Artwork: artwork.md
     - Playlists and Radio: playlists.md
