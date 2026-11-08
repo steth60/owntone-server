@@ -31,4 +31,9 @@ airplay_receiver_stats_json_add(struct json_object *obj);
 bool
 airplay_receiver_is_self(const char *name);
 
+// True unless a sender is streaming to us and playing (rate > 0), so a paused
+// AirPlay stream counts as idle. Thread: any
+bool
+airplay_receiver_is_idle(void);
+
 #endif /* !__AIRPLAY_RECEIVER_H__ */

@@ -39,6 +39,10 @@
         v-text="$t('settings.devices.speaker-pairing-info')"
       />
       <div
+        class="content"
+        v-text="$t('settings.devices.speaker-test-info')"
+      />
+      <div
         v-for="output in outputsStore.outputs"
         :key="output.id"
         class="field columns is-multiline"
@@ -68,6 +72,21 @@
           </control-integer-field>
         </div>
         <div class="column is-one-third">
+          <button
+            class="button is-small mb-2"
+            :class="{ 'is-loading': testRunning && testId === output.id }"
+            :disabled="testRunning"
+            @click="testOutput(output.id)"
+          >
+            <mdicon class="icon" name="volume-high" size="16" />
+            <span v-text="$t('settings.devices.speaker-test')" />
+          </button>
+          <p
+            v-if="testId === output.id && testMessage"
+            class="help"
+            :class="testClass"
+            v-text="testMessage"
+          />
           <form
             v-if="output.needs_auth_key"
             @submit.prevent="pairOutput(output.id)"
@@ -93,6 +112,7 @@
 </template>
 
 <script setup>
+import { computed, ref } from 'vue'
 import ContentWithHeading from '@/templates/ContentWithHeading.vue'
 import ControlIntegerField from '@/components/ControlIntegerField.vue'
 import ControlPinField from '@/components/ControlPinField.vue'
@@ -100,15 +120,20 @@ import ControlSwitch from '@/components/ControlSwitch.vue'
 import PaneTitle from '@/components/PaneTitle.vue'
 import TabsSettings from '@/components/TabsSettings.vue'
 import outputs from '@/api/outputs'
-import { ref } from 'vue'
 import remotes from '@/api/remotes'
+import { useI18n } from 'vue-i18n'
 import { useOutputsStore } from '@/stores/outputs'
 import { useRemotesStore } from '@/stores/remotes'
 
+const { t } = useI18n()
 const outputsStore = useOutputsStore()
 const remotesStore = useRemotesStore()
 
 const outputPin = ref('')
+const testId = ref('')
+const testMessage = ref('')
+const testRunning = ref(false)
+const testState = ref('')
 const remotePairingDisabled = ref(true)
 const remotePin = ref('')
 
@@ -135,5 +160,54 @@ const pairRemote = () => {
 
 const toggleOutput = (identifier) => {
   outputs.toggle(identifier)
+}
+
+const TEST_POLL_MS = 500
+
+const testClass = computed(() => {
+  if (testState.value === 'passed') {
+    return 'is-success'
+  }
+  if (testState.value === 'failed') {
+    return 'is-danger'
+  }
+  return ''
+})
+
+const showTest = (status) => {
+  testState.value = status.state
+  testMessage.value = status.reason || status.message
+}
+
+const pollTest = () => {
+  outputs.testStatus().then((status) => {
+    showTest(status)
+    if (status.state === 'running') {
+      setTimeout(pollTest, TEST_POLL_MS)
+    } else {
+      testRunning.value = false
+    }
+  })
+}
+
+const testOutput = (identifier) => {
+  testId.value = identifier
+  testMessage.value = t('settings.devices.speaker-test-running')
+  testState.value = 'running'
+  testRunning.value = true
+  outputs
+    .test(identifier)
+    .then((status) => {
+      showTest(status)
+      if (status.started) {
+        setTimeout(pollTest, TEST_POLL_MS)
+      } else {
+        testState.value = 'failed'
+        testRunning.value = false
+      }
+    })
+    .catch(() => {
+      testRunning.value = false
+    })
 }
 </script>

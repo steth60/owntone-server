@@ -104,6 +104,20 @@ stats_output_add(uint64_t device_id, enum stats_output_counter counter, uint64_t
 }
 
 void
+stats_output_counters_get(uint64_t device_id, uint64_t counters[STATS_OUTPUT_COUNTERS])
+{
+  struct stats_output *o;
+
+  pthread_mutex_lock(&stats_lck);
+  o = output_get(device_id);
+  if (o)
+    memcpy(counters, o->counters, sizeof(o->counters));
+  else
+    memset(counters, 0, STATS_OUTPUT_COUNTERS * sizeof(uint64_t));
+  pthread_mutex_unlock(&stats_lck);
+}
+
+void
 stats_output_event(uint64_t device_id, const char *event)
 {
   struct stats_output *o;

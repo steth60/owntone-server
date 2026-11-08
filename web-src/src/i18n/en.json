@@ -367,6 +367,9 @@
       "pairing-request": "Remote pairing request from ",
       "speaker-pairing": "Speaker pairing and device verification",
       "speaker-pairing-info": "If your speaker requires pairing, enter the verification code displayed. You can also set an offset compensation (±2000 ms) to synchronise playback between multiple speakers. To apply the offset, please restart the stream.",
+      "speaker-test": "Test",
+      "speaker-test-info": "Test plays a short test tone on that speaker only. It only works while nothing is playing.",
+      "speaker-test-running": "Testing…",
       "verification-code": "Verification code"
     },
     "services": {

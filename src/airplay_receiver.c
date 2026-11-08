@@ -2505,6 +2505,18 @@ airplay_receiver_is_self(const char *name)
   return rx_enabled && name && strcmp(name, rx_name) == 0;
 }
 
+bool
+airplay_receiver_is_idle(void)
+{
+  bool idle;
+
+  pthread_mutex_lock(&rx_stream.lck);
+  idle = !rx_stream.active || rx_stream.rate == 0;
+  pthread_mutex_unlock(&rx_stream.lck);
+
+  return idle;
+}
+
 int
 airplay_receiver_init(void)
 {

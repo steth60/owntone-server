@@ -53,6 +53,7 @@
 #include "misc_json.h"
 #include "stats.h"
 #include "dsp.h"
+#include "speaker_test.h"
 #include "ptpd.h"
 #include "libairptp/airptp.h"
 #include "airplay_receiver.h"
@@ -1924,6 +1925,60 @@ jsonapi_reply_outputs_eq_put(struct httpd_request *hreq)
   DPRINTF(E_INFO, L_WEB, "EQ profile for '%s' %s\n", speaker_info.name, dsp_profile_is_neutral(&profile) ? "turned off" : "updated");
 
   return HTTP_NOCONTENT;
+}
+
+// Starts a speaker test. Always answers 200 with "started" and, if it didn't
+// start, the "reason", so the web interface can show it.
+static int
+jsonapi_reply_outputs_test_start(struct httpd_request *hreq)
+{
+  json_object *jreply;
+  uint64_t output_id;
+  const char *reason = NULL;
+
+  if (safe_atou64(hreq->path_parts[2], &output_id) < 0)
+    return HTTP_BADREQUEST;
+
+  switch (speaker_test_start(output_id))
+    {
+      case SPEAKER_TEST_STARTED:
+	break;
+      case SPEAKER_TEST_ERR_UNKNOWN_SPEAKER:
+	return HTTP_NOTFOUND;
+      case SPEAKER_TEST_ERR_NOT_IDLE:
+	reason = "Something is playing. Pause or stop it to test a speaker.";
+	break;
+      case SPEAKER_TEST_ERR_BUSY:
+	reason = "Another speaker test is running.";
+	break;
+      default:
+	reason = "The test could not start, see the log.";
+    }
+
+  jreply = json_object_new_object();
+  json_object_object_add(jreply, "started", json_object_new_boolean(reason == NULL));
+  if (reason)
+    json_object_object_add(jreply, "reason", json_object_new_string(reason));
+  speaker_test_json_add(jreply);
+
+  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(jreply)));
+  jparse_free(jreply);
+
+  return HTTP_OK;
+}
+
+static int
+jsonapi_reply_outputs_test_get(struct httpd_request *hreq)
+{
+  json_object *jreply;
+
+  jreply = json_object_new_object();
+  speaker_test_json_add(jreply);
+
+  CHECK_ERRNO(L_WEB, evbuffer_add_printf(hreq->out_body, "%s", json_object_to_json_string(jreply)));
+  jparse_free(jreply);
+
+  return HTTP_OK;
 }
 
 static int
@@ -4813,6 +4868,8 @@ static struct httpd_uri_map adm_handlers[] =
     { HTTPD_METHOD_GET,    "^/api/outputs$",                               jsonapi_reply_outputs },
     { HTTPD_METHOD_PUT,    "^/api/outputs/set$",                           jsonapi_reply_outputs_set },
     { HTTPD_METHOD_POST,   "^/api/select-outputs$",                        jsonapi_reply_outputs_set }, // deprecated: use "/api/outputs/set"
+    { HTTPD_METHOD_GET,    "^/api/outputs/test$",                          jsonapi_reply_outputs_test_get },
+    { HTTPD_METHOD_POST,   "^/api/outputs/[[:digit:]]+/test$",             jsonapi_reply_outputs_test_start },
     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+$",                  jsonapi_reply_outputs_get_byid },
     { HTTPD_METHOD_GET,    "^/api/outputs/[[:digit:]]+/eq$",               jsonapi_reply_outputs_eq_get },
     { HTTPD_METHOD_PUT,    "^/api/outputs/[[:digit:]]+/eq$",               jsonapi_reply_outputs_eq_put },

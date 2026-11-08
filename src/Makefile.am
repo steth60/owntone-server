@@ -121,7 +121,7 @@ owntone_SOURCES = main.c \
 	settings.c settings.h \
 	input.h input.c \
 	airplay_receiver.c airplay_receiver.h \
-	dsp.c dsp.h stats.c stats.h \
+	dsp.c dsp.h stats.c stats.h speaker_test.c speaker_test.h \
 	inputs/file.c inputs/http.c inputs/pipe.c inputs/timer.c \
 	outputs.h outputs.c \
 	outputs/rtp_common.h outputs/rtp_common.c \

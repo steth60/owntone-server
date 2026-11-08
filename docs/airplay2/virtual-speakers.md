@@ -75,6 +75,32 @@ flowchart LR
 - **EQ for all speakers.** The EQ page gets an "apply to all speakers" action
   next to the per-speaker controls.
 
+## Speaker layout and test
+
+Each member of a virtual speaker gets a position, like the speaker setup of an
+AV receiver:
+
+| Position | What it plays from a stereo source |
+|---|---|
+| Full range | Both channels (stereo) |
+| Front left, Rear left | Left channel |
+| Front right, Rear right | Right channel |
+| Centre | Left and right mixed to mono |
+| Subwoofer | Mono, low-passed (the existing crossover) |
+
+Per member there is also a level trim in dB and a delay in ms, so speakers at
+different distances arrive together. Position, trim and delay feed the same
+per-speaker DSP chain as the EQ (channel routing, preamp, the stream offset).
+
+**Test button.** Every speaker in the speaker settings, and every member in a
+virtual speaker's layout, has a Test button. It plays a short pink noise burst
+on that speaker alone, at a low fixed level, through its position, trim, delay
+and EQ, so what you hear is what the layout will do. The page then shows
+whether the speaker connected, accepted the audio and stayed connected. A
+"Test all" plays each member in turn (front left, centre, front right, rear
+right, rear left, subwoofer). The same test is in the JSON API, so Home
+Assistant or a script can check speakers.
+
 ## Order of work
 
 1. **Finish the native receiver.** (Realtime playback done, see
@@ -89,6 +115,9 @@ flowchart LR
    instances, store members and policy.
 4. **Speaker claims.** Take over or skip when a speaker is busy.
 5. **EQ for all speakers.** The UI action, and copying member EQ into a new zone.
+   **Speaker test** (Test button and API) comes first, because it also checks
+   speakers for every later step. Then **speaker layout**: positions (centre is
+   new, the rest map to the existing channel routing), level trim and delay.
 6. **Home Assistant.** Add each zone as an OwnTone integration entry, and check
    that play media with local music, radio and Spotify works on each one.
 7. **Bookshelf speaker.** The Pi as a speaker that zones can use.

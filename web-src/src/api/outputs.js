@@ -12,6 +12,12 @@ export default {
   state() {
     return api.get(BASE_URL)
   },
+  test(id) {
+    return api.post(`${BASE_URL}/${id}/test`)
+  },
+  testStatus() {
+    return api.get(`${BASE_URL}/test`)
+  },
   toggle(id) {
     return api.put(`${BASE_URL}/${id}/toggle`)
   },

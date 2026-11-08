@@ -44,6 +44,10 @@ stats_output_event(uint64_t device_id, const char *event);
 void
 stats_output_session_set(uint64_t device_id, const char *transport, bool eq_active, int encoder_sessions);
 
+// Copies the device's counters (zeros if there are none yet)
+void
+stats_output_counters_get(uint64_t device_id, uint64_t counters[STATS_OUTPUT_COUNTERS]);
+
 void
 stats_player_add(enum stats_player_counter counter, uint64_t n);
 
