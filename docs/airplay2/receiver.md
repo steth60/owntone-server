@@ -12,8 +12,8 @@ The sending side, where OwnTone streams to AirPlay speakers, is described in
 !!! warning "Work in progress"
 
     The receiver plays buffered AirPlay 2 streams, which is what Music.app
-    uses. Realtime streams are accepted but stay silent. See
-    [Limitations](#limitations).
+    uses, and realtime streams, which carry a Mac's system sound and video.
+    See [Limitations](#limitations).
 
 ## Quick start
 
@@ -151,6 +151,7 @@ RTSP runs encrypted with ChaCha20-Poly1305 using keys from the pairing.
 | `RECORD`                         | Logged                                                                     |
 | `SETRATEANCHORTIME`              | Sets the rate and anchor. Starts or pauses playback                       |
 | `FLUSHBUFFERED`                  | Drops queued audio. A full flush also flushes the player                  |
+| `FLUSH` with `RTP-Info`          | Realtime: drops audio before `rtptime`, flushes the player and resyncs    |
 | `SET_PARAMETER volume`           | Sets OwnTone's volume                                                      |
 | `SETPEERS`, `SETPEERSX`          | Logged                                                                     |
 | `POST /feedback`                 | Keep-alive. Every fifth one logs the sender clock state                   |
@@ -182,6 +183,46 @@ carry, because senders count with more bits. Without `flushFromSeq`, a flush
 drops everything before `flushUntilSeq` and forgets the anchor. With
 `flushFromSeq`, it drops only that range when it arrives. Senders use the range
 form to replace audio further ahead while the current audio plays on.
+
+### Realtime audio packets
+
+A Mac sends its system sound, and the sound of any video it plays, as a
+realtime stream (type 96, `ct` 2, `spf` 352, `audioFormat` 0x40000). Each UDP
+packet on the data port is plain RTP:
+
+| Bytes        | Content                                              |
+| ------------ | ---------------------------------------------------- |
+| 0 to 1       | RTP flags and payload type                           |
+| 2 to 3       | 16-bit sequence number                               |
+| 4 to 7       | RTP timestamp                                        |
+| 8 to 11      | SSRC, not a format code here                         |
+| 12 to n-9    | ChaCha20-Poly1305 ciphertext and 16-byte tag         |
+| last 8       | Nonce tail                                           |
+
+Decryption works as for buffered packets. The audio is always ALAC
+44100/16/2, the only `audioStream` format the receiver advertises, decoded with
+the standard AirPlay ALAC parameters (352 frames, rice 40/10/14).
+
+UDP can lose or reorder packets. The queue is kept in RTP time order and
+duplicates are dropped. The input leaves the newest 100 ms queued so late
+packets still fit in. A gap of up to 1 s is filled with silence so the rest of
+the stream keeps its timing. A longer gap resyncs to the sender's timeline.
+Retransmissions are not requested.
+
+The timing comes from sync packets (type 215) on the control port, about one
+per second:
+
+| Bytes    | Content                                   |
+| -------- | ----------------------------------------- |
+| 4 to 7   | RTP time A                                |
+| 8 to 15  | Sender network time in nanoseconds        |
+| 16 to 19 | RTP time being sent now                   |
+| 20 to 27 | Sender clock ID                           |
+
+Frame `A - 11025` plays at the network time, the same reading as Shairport
+Sync. A Mac sends 88200 frames (2 s) ahead of that, and delays its video by
+the same amount. The first sync packet sets the anchor and starts playback.
+Later ones only resync when they move the timeline by more than 20 ms.
 
 ### Clock following
 
@@ -258,10 +299,10 @@ at 44.1 or 48 kHz. The player resamples as needed for each output.
 
 ## Limitations
 
-- **Realtime streams (type 96) are silent.** The UDP ports are opened, but the
-  ALAC packets are not decoded yet.
-- **Only AAC-LC is decoded.** ALAC at 48 kHz and 24 bits is recognised but not
-  played.
+- **Only AAC-LC (buffered) and ALAC 44100/16 (realtime) are decoded.** ALAC
+  at 48 kHz and 24 bits is recognised but not played.
+- **Lost realtime packets become silence.** Retransmissions are not
+  requested.
 - **There is no drift correction during a stream.** OwnTone syncs once per
   anchor and then plays at its own clock rate. A drift of 6 ppm adds about
   22 ms per hour. Every pause, skip or seek brings a new anchor and resyncs.
@@ -285,6 +326,8 @@ was captured from a Shairport Sync receiver fed by OwnTone.
 | New track after a skip                       | 0.9 s                 |
 | Seek                                         | 0.7 s                 |
 | Music.app command round trip                 | 0.2 to 0.9 s          |
+| Realtime: Mac system sound to the speaker    | 1.97 to 1.99 s, steady (the Mac's own latency is 2.0 s) |
+| Realtime: packet errors, gaps, resyncs over 20 s | None              |
 
 ## Shairport Sync and the pipe instead
 

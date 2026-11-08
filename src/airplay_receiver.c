@@ -111,6 +111,22 @@
 #define RX_SSRC_AAC_44100       0x16000000
 #define RX_SSRC_AAC_48000       0x17000000
 #define RX_AAC_FRAME_SAMPLES    1024
+// Realtime packets don't carry a format in their SSRC. They are always ALAC
+// 44100/16/2 (the only audioStream format we advertise), so this audioFormat
+// bit stands in for the SSRC.
+#define RX_FMT_ALAC_44100_S16   0x00040000
+#define RX_ALAC_FRAME_SAMPLES   352
+// The anchor in a realtime sync packet is this many frames later than the
+// frame it names, see Shairport Sync's rtp_ap2_control_receiver()
+#define RX_REALTIME_ANCHOR_FUDGE 11025
+// Hold back this much realtime audio so packets that arrive out of order
+// still get in line
+#define RX_REALTIME_REORDER_FRAMES 4410
+// A gap in realtime audio up to this long is filled with silence, a longer
+// one makes the input find its place on the sender's timeline again
+#define RX_REALTIME_GAP_MAX_FRAMES 44100
+// A realtime sync packet that moves the timeline by more than this resyncs
+#define RX_REALTIME_RESYNC_NS   20000000LL
 #define RX_BODY_MAX             (4 * 1024 * 1024)
 #define RX_UUID_LEN             37
 #define RX_ADDR_LEN             (INET6_ADDRSTRLEN + 8)
@@ -217,6 +233,7 @@ struct rx_stream
 
   bool active;
   bool ended;
+  bool realtime; // Type 96 over UDP, else type 103 over TCP
   int session_id;
   char *client_name;
   uint8_t key[32];
@@ -236,6 +253,9 @@ struct rx_stream
   // Packets up to (not including) this sequence number are dropped on arrival
   bool flush_active;
   uint32_t flush_until_seq;
+  // Realtime: packets before this RTP time are dropped on arrival (FLUSH)
+  bool flush_rtp_active;
+  uint32_t flush_until_rtptime;
   // Deferred flush of a range further ahead
   bool flush_range_active;
   uint32_t flush_from_seq;
@@ -641,6 +661,10 @@ service_tcp_event_cb(struct bufferevent *bev, short events, void *arg)
 
 static void
 buffered_read_cb(struct bufferevent *bev, void *arg);
+static void
+stream_packet_add(const uint8_t *p, size_t len, bool realtime);
+static void
+realtime_control_packet(struct rx_session *s, const uint8_t *p, size_t len);
 
 static void
 service_accept_cb(struct evconnlistener *listener, evutil_socket_t fd, struct sockaddr *address, int socklen, void *arg)
@@ -679,6 +703,14 @@ service_udp_read_cb(evutil_socket_t fd, short what, void *arg)
     {
       svc->bytes += len;
       svc->packets++;
+
+      if (svc->session->stream_type != 96)
+	continue;
+
+      if (svc->kind == RX_SERVICE_DATA)
+	stream_packet_add(buf, len, true);
+      else if (svc->kind == RX_SERVICE_CONTROL)
+	realtime_control_packet(svc->session, buf, len);
     }
 }
 
@@ -760,10 +792,22 @@ seq_before(uint32_t a, uint32_t b)
   return diff != 0 && diff >= 0x400000;
 }
 
+static inline uint64_t
+be64_get(const uint8_t *p)
+{
+  return ((uint64_t)be32_get(p) << 32) | be32_get(p + 4);
+}
+
 static int
 ssrc_sample_rate(uint32_t ssrc)
 {
   return (ssrc == RX_SSRC_AAC_48000 || ssrc == RX_SSRC_ALAC_48000_S24) ? 48000 : 44100;
+}
+
+static int
+ssrc_frame_samples(uint32_t ssrc)
+{
+  return (ssrc == RX_FMT_ALAC_44100_S16) ? RX_ALAC_FRAME_SAMPLES : RX_AAC_FRAME_SAMPLES;
 }
 
 static void
@@ -801,6 +845,7 @@ stream_clear_locked(void)
   rx_stream.anchor_valid = false;
   rx_stream.flush_active = false;
   rx_stream.flush_range_active = false;
+  rx_stream.flush_rtp_active = false;
   rx_stream.generation++;
 }
 
@@ -812,6 +857,7 @@ stream_start(struct rx_session *s, const uint8_t *key, size_t key_len)
   stream_clear_locked();
   rx_stream.active = true;
   rx_stream.ended = false;
+  rx_stream.realtime = (s->stream_type == 96);
   rx_stream.session_id = s->id;
   free(rx_stream.client_name);
   rx_stream.client_name = s->client_name ? strdup(s->client_name) : NULL;
@@ -920,6 +966,26 @@ stream_flush(bool has_from, uint32_t from_seq, uint32_t until_seq)
   pthread_mutex_unlock(&rx_stream.lck);
 }
 
+// Realtime FLUSH: drop everything before rtptime, now and on arrival, then
+// find our place on the sender's timeline again
+static void
+stream_flush_rtptime(uint32_t rtptime)
+{
+  pthread_mutex_lock(&rx_stream.lck);
+
+  while (rx_stream.head && (int32_t)(rx_stream.head->rtptime - rtptime) < 0)
+    {
+      stream_drop_head_locked();
+      rx_stream.packets_dropped++;
+    }
+
+  rx_stream.flush_rtp_active = true;
+  rx_stream.flush_until_rtptime = rtptime;
+  rx_stream.generation++;
+
+  pthread_mutex_unlock(&rx_stream.lck);
+}
+
 // Caller must hold rx_stream.lck. Returns true if the packet must be dropped
 static bool
 stream_flush_check_locked(uint32_t seq)
@@ -942,35 +1008,87 @@ stream_flush_check_locked(uint32_t seq)
   return false;
 }
 
-// A buffered audio packet: 4 bytes marker + 23 bit sequence number, 4 bytes
-// RTP timestamp, 4 bytes SSRC (the format), then the ChaCha20-Poly1305
-// ciphertext with its 16 byte tag, then the last 8 bytes of the 12 byte
-// nonce. The timestamp and SSRC are the additional authenticated data.
+// Caller must hold rx_stream.lck. Realtime packets come over UDP, so they can
+// arrive out of order or twice. They are kept in RTP time order, and the
+// input holds some back (RX_REALTIME_REORDER_FRAMES) so late ones fit in.
+// Returns false if the packet is a duplicate.
+static bool
+stream_realtime_insert_locked(struct rx_packet *pkt)
+{
+  struct rx_packet *prev = NULL;
+  struct rx_packet *cur;
+
+  if (!rx_stream.tail || (int32_t)(pkt->rtptime - rx_stream.tail->rtptime) > 0)
+    {
+      if (rx_stream.tail)
+	rx_stream.tail->next = pkt;
+      else
+	rx_stream.head = pkt;
+      rx_stream.tail = pkt;
+      return true;
+    }
+
+  for (cur = rx_stream.head; cur && (int32_t)(pkt->rtptime - cur->rtptime) > 0; cur = cur->next)
+    prev = cur;
+
+  if (cur && cur->rtptime == pkt->rtptime)
+    return false;
+
+  pkt->next = cur;
+  if (prev)
+    prev->next = pkt;
+  else
+    rx_stream.head = pkt;
+  return true;
+}
+
+// An audio packet: 4 bytes marker + sequence number, 4 bytes RTP timestamp,
+// 4 bytes SSRC, then the ChaCha20-Poly1305 ciphertext with its 16 byte tag,
+// then the last 8 bytes of the 12 byte nonce. The timestamp and SSRC are the
+// additional authenticated data. Buffered packets have a 23 bit sequence
+// number and the format in the SSRC. Realtime packets are plain RTP (16 bit
+// sequence number) and always ALAC.
 static void
-stream_packet_add(const uint8_t *p, size_t len)
+stream_packet_add(const uint8_t *p, size_t len, bool realtime)
 {
   struct rx_packet *pkt;
   uint8_t nonce[12] = { 0 };
   unsigned long long plain_len = 0;
   uint32_t seq;
   uint32_t ssrc;
+  uint32_t rtptime;
   int ret;
 
   if (len < 12 + crypto_aead_chacha20poly1305_ietf_ABYTES + 8)
     return;
 
-  seq = be32_get(p) & RX_SEQ_MASK;
-  ssrc = be32_get(p + 8);
-  if (ssrc == RX_SSRC_NONE)
-    return; // Filler between formats, no audio
+  rtptime = be32_get(p + 4);
+  if (realtime)
+    {
+      seq = ((uint32_t)p[2] << 8) | p[3];
+      ssrc = RX_FMT_ALAC_44100_S16;
+    }
+  else
+    {
+      seq = be32_get(p) & RX_SEQ_MASK;
+      ssrc = be32_get(p + 8);
+      if (ssrc == RX_SSRC_NONE)
+	return; // Filler between formats, no audio
+    }
 
   pthread_mutex_lock(&rx_stream.lck);
 
   rx_stream.packets_in++;
 
-  if (!rx_stream.active || !rx_stream.has_key)
+  if (!rx_stream.active || !rx_stream.has_key || rx_stream.realtime != realtime)
     goto drop;
-  if (stream_flush_check_locked(seq))
+  if (realtime && rx_stream.flush_rtp_active)
+    {
+      if ((int32_t)(rtptime - rx_stream.flush_until_rtptime) < 0)
+	goto drop;
+      rx_stream.flush_rtp_active = false;
+    }
+  if (!realtime && stream_flush_check_locked(seq))
     goto drop;
 
   CHECK_NULL(L_AIRPLAY_RX, pkt = calloc(1, sizeof(struct rx_packet)));
@@ -988,15 +1106,26 @@ stream_packet_add(const uint8_t *p, size_t len)
     }
 
   pkt->seq = seq;
-  pkt->rtptime = be32_get(p + 4);
+  pkt->rtptime = rtptime;
   pkt->ssrc = ssrc;
   pkt->len = plain_len;
 
-  if (rx_stream.tail)
-    rx_stream.tail->next = pkt;
+  if (realtime)
+    {
+      if (!stream_realtime_insert_locked(pkt))
+	{
+	  packet_free(pkt);
+	  goto drop;
+	}
+    }
   else
-    rx_stream.head = pkt;
-  rx_stream.tail = pkt;
+    {
+      if (rx_stream.tail)
+	rx_stream.tail->next = pkt;
+      else
+	rx_stream.head = pkt;
+      rx_stream.tail = pkt;
+    }
   rx_stream.queued_bytes += pkt->len;
 
   // The sender respects the audioBufferSize we gave it, so this is only a
@@ -1040,7 +1169,7 @@ buffered_read_cb(struct bufferevent *bev, void *arg)
 	break;
 
       p = evbuffer_pullup(input, len);
-      stream_packet_add(p + 2, len - 2);
+      stream_packet_add(p + 2, len - 2, false);
       evbuffer_drain(input, len);
 
       svc->bytes += len;
@@ -1758,8 +1887,12 @@ handle_setup_streams(struct rx_session *s, struct rx_request *req, struct rx_res
 
   session_streams_stop(s);
   s->stream_type = type;
+  s->anchor_valid = false;
 
-  if (type == 103)
+  if (type == 96 && audio_format && audio_format != RX_FMT_ALAC_44100_S16)
+    DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: realtime audioFormat 0x%" PRIx64 " is not ALAC 44100/16/2, playback will fail\n", s->id, audio_format);
+
+  if (type == 96 || type == 103)
     stream_start(s, (uint8_t *)shk, shk_len);
   if (shk)
     {
@@ -2001,6 +2134,93 @@ handle_flushbuffered(struct rx_session *s, struct rx_request *req, struct rx_res
     player_job_queue(RX_PLAYER_FLUSH, s, "flush", 0);
 }
 
+// Realtime streams flush with "RTP-Info: seq=...;rtptime=..."
+static void
+handle_flush(struct rx_session *s, struct rx_request *req, struct rx_response *resp)
+{
+  const char *info = keyval_get(&req->headers, "RTP-Info");
+  const char *p;
+  uint32_t rtptime;
+
+  if (s->stream_type != 96)
+    return;
+
+  p = info ? strstr(info, "rtptime=") : NULL;
+  if (!p)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: FLUSH without rtptime, ignored\n", s->id);
+      return;
+    }
+
+  rtptime = (uint32_t)strtoul(p + strlen("rtptime="), NULL, 10);
+  DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: FLUSH realtime audio before rtptime %u\n", s->id, rtptime);
+
+  stream_flush_rtptime(rtptime);
+  player_job_queue(RX_PLAYER_FLUSH, s, "flush", 0);
+}
+
+// The realtime control channel. The sender sends a sync packet (type 215)
+// about once a second: bytes 4-7 an RTP time, 8-15 the sender's network time
+// in nanoseconds, 16-19 the RTP time being sent now, 20-27 the clock ID. The
+// frame that plays at the network time is the first RTP time minus
+// RX_REALTIME_ANCHOR_FUDGE, which makes the latency 2 s (Shairport Sync uses
+// the same). Retransmitted audio (type 214) is ignored, we don't ask for any.
+// Thread: airplayrx
+static void
+realtime_control_packet(struct rx_session *s, const uint8_t *p, size_t len)
+{
+  struct airptp_clock_info ci;
+  uint32_t rtptime;
+  uint32_t rtptime_now;
+  uint64_t remote_ns;
+  uint64_t clock_id;
+  uint64_t local_ns;
+  int64_t predicted_ns;
+  int64_t moved_ns;
+  bool synced;
+
+  if (len < 28 || p[1] != 215)
+    return;
+
+  rtptime = be32_get(p + 4) - RX_REALTIME_ANCHOR_FUDGE;
+  remote_ns = be64_get(p + 8);
+  rtptime_now = be32_get(p + 16);
+  clock_id = be64_get(p + 20);
+
+  synced = (ptpd_clock_info_get(&ci, clock_id) == 0);
+  if (synced)
+    local_ns = remote_ns - ci.offset_ns;
+  else if (!s->anchor_valid)
+    local_ns = now_ns(); // Unsynchronised: the network time is about now
+  else
+    return;
+
+  if (s->anchor_valid)
+    {
+      // Only move the timeline if the sender's clock moved it noticeably,
+      // every resync restarts the input on the timeline
+      predicted_ns = (int64_t)s->anchor_local_ns + (int64_t)(int32_t)(rtptime - s->anchor_rtptime) * 1000000000LL / 44100;
+      moved_ns = (int64_t)local_ns - predicted_ns;
+      if (llabs(moved_ns) < RX_REALTIME_RESYNC_NS)
+	return;
+
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: realtime timeline moved %+" PRIi64 " ms, resyncing\n", s->id, moved_ns / 1000000);
+    }
+  else
+    DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: realtime anchor rtpTime %u plays %" PRIi64 " ms from now, sender latency %d frames, %s clock %" PRIx64 "\n",
+	    s->id, rtptime, ((int64_t)local_ns - (int64_t)now_ns()) / 1000000, (int32_t)(rtptime_now - rtptime),
+	    synced ? "following" : "NOT following, unsynchronised,", clock_id);
+
+  s->anchor_valid = true;
+  s->anchor_rate = 1;
+  s->anchor_rtptime = rtptime;
+  s->anchor_clock_id = clock_id;
+  s->anchor_local_ns = local_ns;
+
+  stream_anchor_set(1, true, rtptime, local_ns);
+  player_job_queue(RX_PLAYER_START, s, "realtime anchor", 0);
+}
+
 static void
 request_handle(struct rx_session *s, struct rx_request *req)
 {
@@ -2055,9 +2275,10 @@ request_handle(struct rx_session *s, struct rx_request *req)
     }
   else if (strcmp(req->method, "FLUSHBUFFERED") == 0)
     handle_flushbuffered(s, req, &resp);
-  else if (strcmp(req->method, "FLUSH") == 0 || strcmp(req->method, "SETRATE") == 0 ||
-	   strcmp(req->method, "PAUSE") == 0)
-    ; // Accept, playback control comes in phase 3
+  else if (strcmp(req->method, "FLUSH") == 0)
+    handle_flush(s, req, &resp);
+  else if (strcmp(req->method, "SETRATE") == 0 || strcmp(req->method, "PAUSE") == 0)
+    ; // Accept
   else
     {
       DPRINTF(E_LOG, L_AIRPLAY_RX, "Connection %d: unhandled request %s %s\n", s->id, req->method, req->path);
@@ -2239,6 +2460,8 @@ airplay_receiver_stats_json_add(struct json_object *obj)
 
   pthread_mutex_lock(&rx_stream.lck);
   json_object_object_add(rx, "streaming", json_object_new_boolean(rx_stream.active));
+  if (rx_stream.active)
+    json_object_object_add(rx, "stream_type", json_object_new_string(rx_stream.realtime ? "realtime" : "buffered"));
   if (rx_stream.client_name)
     json_object_object_add(rx, "sender", json_object_new_string(rx_stream.client_name));
   json_object_object_add(rx, "playing", json_object_new_boolean(rx_stream.active && rx_stream.rate > 0));
@@ -2408,6 +2631,11 @@ struct rx_input_ctx
   struct timespec sync_ts;
   short pending_flags;
 
+  // Realtime: the RTP time the next packet should have, to fill lost ones
+  bool has_next_rtptime;
+  uint32_t next_rtptime;
+  bool resync; // Gap too long to fill, find our place again
+
   int16_t *pcm;
   size_t pcm_samples;
 };
@@ -2421,6 +2649,58 @@ decoder_close(struct rx_input_ctx *ctx)
   ctx->ssrc = 0;
 }
 
+// Realtime audio is ALAC with the parameters every AirPlay sender uses (the
+// AirPlay 1 fmtp "96 352 0 16 40 10 14 2 255 0 0 44100"). libavcodec wants
+// them as the 36 byte ALAC magic cookie.
+static int
+decoder_open_alac(struct rx_input_ctx *ctx, struct input_source *source)
+{
+  static const uint8_t cookie[36] = {
+    0x00, 0x00, 0x00, 0x24, 'a', 'l', 'a', 'c', 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x01, 0x60, // Frame length 352
+    0x00,                   // Compatible version
+    16,                     // Bit depth
+    40, 10, 14,             // Rice history mult, initial history, limit
+    2,                      // Channels
+    0x00, 0xff,             // Max run
+    0x00, 0x00, 0x00, 0x00, // Max frame bytes
+    0x00, 0x00, 0x00, 0x00, // Average bit rate
+    0x00, 0x00, 0xac, 0x44, // Sample rate 44100
+  };
+  const AVCodec *codec;
+  int ret;
+
+  codec = avcodec_find_decoder(AV_CODEC_ID_ALAC);
+  if (!codec)
+    return -1;
+
+  CHECK_NULL(L_AIRPLAY_RX, ctx->dec = avcodec_alloc_context3(codec));
+  ctx->dec->sample_rate = 44100;
+  av_channel_layout_default(&ctx->dec->ch_layout, 2);
+  CHECK_NULL(L_AIRPLAY_RX, ctx->dec->extradata = av_mallocz(sizeof(cookie) + AV_INPUT_BUFFER_PADDING_SIZE));
+  memcpy(ctx->dec->extradata, cookie, sizeof(cookie));
+  ctx->dec->extradata_size = sizeof(cookie);
+
+  ret = avcodec_open2(ctx->dec, codec, NULL);
+  if (ret < 0)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Could not open ALAC decoder: %s\n", av_err2str(ret));
+      decoder_close(ctx);
+      return -1;
+    }
+
+  CHECK_NULL(L_AIRPLAY_RX, ctx->pkt = av_packet_alloc());
+  CHECK_NULL(L_AIRPLAY_RX, ctx->frame = av_frame_alloc());
+  ctx->ssrc = RX_FMT_ALAC_44100_S16;
+
+  source->quality.sample_rate = 44100;
+  source->quality.bits_per_sample = 16;
+  source->quality.channels = 2;
+
+  DPRINTF(E_INFO, L_AIRPLAY_RX, "Decoding ALAC 44100 Hz stereo (realtime)\n");
+  return 0;
+}
+
 static int
 decoder_open(struct rx_input_ctx *ctx, struct input_source *source, uint32_t ssrc)
 {
@@ -2431,6 +2711,9 @@ decoder_open(struct rx_input_ctx *ctx, struct input_source *source, uint32_t ssr
   int ret;
 
   decoder_close(ctx);
+
+  if (ssrc == RX_FMT_ALAC_44100_S16)
+    return decoder_open_alac(ctx, source);
 
   if (ssrc != RX_SSRC_AAC_44100 && ssrc != RX_SSRC_AAC_48000)
     {
@@ -2535,10 +2818,52 @@ frame_write(struct evbuffer *evbuf, struct rx_input_ctx *ctx, AVFrame *frame)
   evbuffer_add(evbuf, ctx->pcm, n * 2 * sizeof(int16_t));
 }
 
+// Realtime packets lost on the way would pull the rest of the stream earlier,
+// so a short gap becomes silence and a long one a resync. Returns false if
+// the packet is older than what was already written.
+static bool
+realtime_gap_fill(struct rx_input_ctx *ctx, struct input_source *source, struct rx_packet *pkt)
+{
+  static const int16_t silence[2 * RX_ALAC_FRAME_SAMPLES];
+  int32_t gap;
+  int32_t n;
+
+  if (!ctx->has_next_rtptime)
+    goto done;
+
+  gap = (int32_t)(pkt->rtptime - ctx->next_rtptime);
+  if (gap < 0)
+    return false;
+
+  if (gap > RX_REALTIME_GAP_MAX_FRAMES)
+    {
+      DPRINTF(E_LOG, L_AIRPLAY_RX, "Realtime audio jumped %d ms ahead, resyncing to the sender's timeline\n", gap * 1000 / 44100);
+      ctx->resync = true;
+      goto done;
+    }
+
+  if (gap > 0)
+    DPRINTF(E_DBG, L_AIRPLAY_RX, "Filling %d ms of lost realtime audio with silence\n", gap * 1000 / 44100);
+
+  for (; gap > 0; gap -= n)
+    {
+      n = (gap < RX_ALAC_FRAME_SAMPLES) ? gap : RX_ALAC_FRAME_SAMPLES;
+      evbuffer_add(source->evbuf, silence, n * 2 * sizeof(int16_t));
+    }
+
+ done:
+  ctx->has_next_rtptime = true;
+  ctx->next_rtptime = pkt->rtptime + RX_ALAC_FRAME_SAMPLES;
+  return true;
+}
+
 static void
 packet_decode(struct rx_input_ctx *ctx, struct input_source *source, struct rx_packet *pkt)
 {
   int ret;
+
+  if (pkt->ssrc == RX_FMT_ALAC_44100_S16 && !realtime_gap_fill(ctx, source, pkt))
+    return;
 
   if (pkt->ssrc != ctx->ssrc && decoder_open(ctx, source, pkt->ssrc) < 0)
     return;
@@ -2551,7 +2876,7 @@ packet_decode(struct rx_input_ctx *ctx, struct input_source *source, struct rx_p
   ret = avcodec_send_packet(ctx->dec, ctx->pkt);
   if (ret < 0)
     {
-      DPRINTF(E_WARN, L_AIRPLAY_RX, "AAC decoder rejected packet seq %u: %s\n", pkt->seq, av_err2str(ret));
+      DPRINTF(E_WARN, L_AIRPLAY_RX, "Decoder rejected packet seq %u: %s\n", pkt->seq, av_err2str(ret));
       return;
     }
 
@@ -2615,6 +2940,7 @@ rxin_play(struct input_source *source)
   int64_t audible_ns;
   int64_t pts_ns;
   int64_t now;
+  int max_packets;
   int n;
   int ret;
 
@@ -2628,10 +2954,12 @@ rxin_play(struct input_source *source)
       return -1;
     }
 
-  if (ctx->generation != rx_stream.generation)
+  if (ctx->generation != rx_stream.generation || ctx->resync)
     {
       ctx->generation = rx_stream.generation;
       ctx->synced = false;
+      ctx->resync = false;
+      ctx->has_next_rtptime = false;
       rx_stream.late_frames_dropped = 0;
     }
 
@@ -2642,7 +2970,7 @@ rxin_play(struct input_source *source)
   if (!ctx->synced)
     {
       // Skip what should already have played before the anchor
-      while (rx_stream.head && (int32_t)(rx_stream.head->rtptime + RX_AAC_FRAME_SAMPLES - rx_stream.anchor_rtptime) <= 0)
+      while (rx_stream.head && (int32_t)(rx_stream.head->rtptime + ssrc_frame_samples(rx_stream.head->ssrc) - rx_stream.anchor_rtptime) <= 0)
 	{
 	  stream_drop_head_locked();
 	  rx_stream.packets_dropped++;
@@ -2661,7 +2989,7 @@ rxin_play(struct input_source *source)
 	  frame_offset = (int32_t)(rx_stream.head->rtptime - rx_stream.anchor_rtptime);
 	  audible_ns = (int64_t)rx_stream.anchor_local_ns + frame_offset * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
 	  pts_ns = audible_ns - (int64_t)outputs_buffer_duration_ms_get() * 1000000LL;
-	  frame_ns = RX_AAC_FRAME_SAMPLES * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
+	  frame_ns = ssrc_frame_samples(rx_stream.head->ssrc) * 1000000000LL / ssrc_sample_rate(rx_stream.head->ssrc);
 
 	  if (pts_ns + frame_ns / 2 >= now)
 	    break;
@@ -2681,10 +3009,10 @@ rxin_play(struct input_source *source)
 
       if (rx_stream.late_frames_dropped)
 	DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream on the sender's timeline, skipped %" PRIu64 " ms that was due before the outputs could play it\n",
-		rx_stream.late_frames_dropped * RX_AAC_FRAME_SAMPLES * 1000 / ssrc_sample_rate(rx_stream.head->ssrc));
+		rx_stream.late_frames_dropped * ssrc_frame_samples(rx_stream.head->ssrc) * 1000 / ssrc_sample_rate(rx_stream.head->ssrc));
       else
 	DPRINTF(E_LOG, L_AIRPLAY_RX, "Starting AirPlay stream at the sender's anchor (seq %u, rtptime %u)\n", rx_stream.head->seq, rx_stream.head->rtptime);
-      rx_stream.late_ms_total += rx_stream.late_frames_dropped * RX_AAC_FRAME_SAMPLES * 1000 / ssrc_sample_rate(rx_stream.head->ssrc);
+      rx_stream.late_ms_total += rx_stream.late_frames_dropped * ssrc_frame_samples(rx_stream.head->ssrc) * 1000 / ssrc_sample_rate(rx_stream.head->ssrc);
       rx_stream.late_frames_dropped = 0;
 
       // Less than half a frame late at most, the player can't start in the past
@@ -2697,9 +3025,15 @@ rxin_play(struct input_source *source)
       flags |= INPUT_FLAG_SYNC | INPUT_FLAG_METADATA;
     }
 
-  // Take a few packets off the queue, decode them without holding the lock
-  for (n = 0, last = NULL; rx_stream.head && n < RX_INPUT_PACKETS_PER_READ; n++)
+  // Take a few packets off the queue, decode them without holding the lock.
+  // Realtime audio arrives about 2 s ahead, so some can stay queued for
+  // packets that arrive out of order.
+  max_packets = RX_INPUT_PACKETS_PER_READ * RX_AAC_FRAME_SAMPLES / ssrc_frame_samples(rx_stream.head ? rx_stream.head->ssrc : 0);
+  for (n = 0, last = NULL; rx_stream.head && n < max_packets; n++)
     {
+      if (rx_stream.realtime && (int32_t)(rx_stream.tail->rtptime - rx_stream.head->rtptime) < RX_REALTIME_REORDER_FRAMES)
+	break;
+
       pkt = rx_stream.head;
       rx_stream.head = pkt->next;
       if (!rx_stream.head)

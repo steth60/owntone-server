@@ -381,7 +381,9 @@ live_resume_ready(void)
   struct media_quality *q = &input_buffer.cur_write_quality;
   size_t bytes;
 
-  if (!input_buffer.full_cb || input_now_reading.type != INPUT_TYPE_PIPE)
+  // Inputs that arrive in real time: a pipe, and the AirPlay receiver (a
+  // realtime stream is only about 1.5 s ahead of the outputs)
+  if (!input_buffer.full_cb || (input_now_reading.type != INPUT_TYPE_PIPE && input_now_reading.type != INPUT_TYPE_AIRPLAY))
     return false;
 
   if (q->sample_rate > 0 && q->bits_per_sample > 0 && q->channels > 0)

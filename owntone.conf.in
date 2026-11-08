@@ -329,8 +329,8 @@ audio {
 
 # AirPlay 2 receiver: OwnTone appears as an AirPlay speaker, so Music.app
 # or an iPhone can stream to it and OwnTone plays it on its own outputs.
-# Plays buffered AirPlay 2 streams (Music.app). Realtime streams are
-# accepted but not played yet. See docs/airplay2/receiver.md
+# Plays buffered AirPlay 2 streams (Music.app) and realtime streams (a
+# Mac's system sound and video). See docs/airplay2/receiver.md
 #airplay_receiver {
 #	enabled = false
 #	# Name shown to senders
